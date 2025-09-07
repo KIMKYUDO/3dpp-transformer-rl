@@ -1,0 +1,12 @@
+# 모델(Model) 설정
+transformer:
+  d_model: 128
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  num_heads_encoder: 4
+  num_heads_decoder: 8
+  dropout: 0.1
+
+embedding:
+  use_positional_encoding: true
+  orientation_classes: 6

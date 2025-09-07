@@ -1,0 +1,13 @@
+numpy>=1.23
+pyyaml>=6.0
+pytest>=7.0
+# CUDA 버전에 맞는 PyTorch 선택 (예: CUDA 12.1)
+torch==2.8.0+cu121     # GPU 버전 (CUDA 12.1 빌드)
+tensorboard>=2.12
+matplotlib>=3.7
+tqdm>=4.66
+
+'''
+설치 명령 (CUDA 12.1 예시):
+pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu121
+'''

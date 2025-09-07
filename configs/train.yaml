@@ -1,0 +1,20 @@
+# 학습(Training) 설정
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.96
+  clip_epsilon: 0.12
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+
+optimizer:
+  policy_lr: 1e-5
+  value_lr: 1e-4
+  weight_decay: 0.0
+
+schedule:
+  num_updates: 5
+  epochs_per_update: 4
+  batch_size: 32
+  log_interval: 50
+  save_interval: 500
