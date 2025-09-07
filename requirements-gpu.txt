@@ -1,8 +1,18 @@
-numpy>=1.23
-pyyaml>=6.0
-pytest>=7.0
-# CUDA 버전에 맞는 PyTorch 선택 (예: CUDA 12.1)
-torch==2.8.0+cu121     # GPU 버전 (CUDA 12.1 빌드)
-tensorboard>=2.12
-matplotlib>=3.7
-tqdm>=4.66
+# === Core Deep Learning ===
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
+
+# === Array & Math ===
+numpy==1.26.4
+scipy==1.14.1
+
+# === Data & Utils ===
+pyyaml==6.0.2
+tqdm==4.66.5
+
+# === Visualization ===
+matplotlib==3.9.2
+
+# === Testing ===
+pytest==8.3.3
