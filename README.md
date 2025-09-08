@@ -257,4 +257,5 @@ MIT 또는 내부 정책에 맞게 선택 후 표기하세요.
 ## 🔗 Project Resources
 
 - 📄 **Notion 문서**: [팀 노션 페이지](https://www.notion.so/268beaebaf7c80329846c1c1f46c79b2?source=copy_link)
-- 📕 **프로젝트 제안서 (PDF)**: [2025-09-08_3DPP_RL_Proposal_v1.0_ko.pdf](./2025-09-08_3DPP_RL_Proposal_v1.0_ko.pdf)
+- 📕 **프로젝트 제안서 (PDF)**: [열기](./docs/2025-09-08_3DPP_RL_Proposal_v1.0_ko.pdf)
+- 📝 **수행계획서 양식 (HWP)**: [다운로드](./docs/[양식]산학협력프로젝트_수행계획서_프로젝트명.hwp)
