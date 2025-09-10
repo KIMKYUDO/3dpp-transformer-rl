@@ -13,17 +13,59 @@
 
 ---
 
-## 📂 Folder Structure
-```
+## 📁 Folder Structure (핵심 역할 주석 포함)
+
+```text
 projects/
-  agents/{backbone.py, heads.py, value_head.py}
-  configs/{env.yaml, model.yaml, train.yaml}
-  envs/{container_sim.py}
-  results/{ckpt/, logs/, plots/}
-  tests/{test_backbone.py, test_env.py, test_heads.py, test_preprocess.py, test_value_head.py}
-  train/{train_ppo.py}
-  utils/{preprocess.py}
+├─ agents/
+│  ├─ backbone.py            # Box/Container 인코더 포함 공용 Transformer 백본(포지셔널 인코딩·멀티헤드·층수 등 모델 골격)
+│  ├─ heads.py               # 세 디코더(위치/선택/방향) + PositionEmbeddingBuilder + OrientationEmbedder; log_softmax 출력
+│  └─ value_head.py          # 정책과 입력 동일 구조로 V(s) 스칼라 추정하는 ValueNet(critic 헤드)
+│
+├─ configs/
+│  ├─ env.yaml               # 환경 파라미터: 컨테이너 L/W/H, seed, 박스크기분포·개수, invalid_penalty 등
+│  ├─ model.yaml             # 모델 파라미터: d_model, 인코더/디코더 레이어 수, heads(enc/dec), dropout, orient_classes 등
+│  └─ train.yaml             # 학습 파라미터: PPO(γ, λ, clip, entropy/value coef), lr(policy/value), 배치·에폭·저장주기 등
+│
+├─ envs/
+│  └─ container_sim.py       # heightmap 기반 3D 적재 Gym 환경: action=(x,y,box_idx,orient), 충돌/경계/지지면 체크, 보상/UR 계산
+│
+├─ results/
+│  ├─ ckpt/                  # 체크포인트 저장(자동 재개용 *_latest_{resume,post}.pt + 마일스톤 *_u{global}.pt)
+│  ├─ logs/                  # CSV/TensorBoard 로그
+│  └─ plots/                 # 학습 곡선/지표 시각화 이미지
+│
+├─ tests/
+│  ├─ test_backbone.py       # backbone 입출력 shape·마스킹·attention 동작 단위테스트
+│  ├─ test_env.py            # 환경 step/reset/보상/terminal·invalid penalty·gap 계산 검증
+│  ├─ test_heads.py          # 위치/선택/방향 디코더 확률분포 합=1·shape 검증, 위치임베딩 빌더 확인
+│  ├─ test_preprocess.py     # 전처리 다운샘플/플래튼/경계거리 채널 생성 검증
+│  └─ test_value_head.py     # ValueNet 전파·출력 스칼라·loss 역전파 동작 확인
+│
+├─ train/
+│  └─ train_ppo.py           # PPO+GAE 학습 스크립트: YAML 로드, 루프/로깅/플롯, 안전 저장·자동 재개·KeyboardInterrupt 대응
+│
+├─ utils/
+│  └─ preprocess.py          # 컨테이너 7채널 plane features 생성, 100×100→10×10 패치 다운샘플, encoder용 flatten 유틸
+│
+├─ .gitignore                # venv/ckpt/logs/plots/pycache 등 제외 규칙
+├─ README.md                 # 프로젝트 개요/설치/실행법/구조/지표 설명(본 섹션 붙여넣기 위치)
+├─ requirements-cpu.txt      # CPU 환경 의존성(pytorch CPU 빌드 등)
+└─ requirements-gpu.txt      # GPU 환경 의존성(cuda/cudnn 맞춤 pytorch 버전 등)
 ```
+
+### 파일별 핵심 개념 요약
+- **agents/backbone.py**: Box/Container 두 인코더를 통해 상태를 임베딩하고, 디코더·Value 헤드가 재사용할 공용 표현을 만듭니다.  
+- **agents/heads.py**: 체인룰 정책(**위치→박스→방향**)을 구현하는 세 디코더와 보조 임베딩 모듈을 제공합니다.  
+- **agents/value_head.py**: 동일 입력으로 상태가치 V(s)를 추정해 PPO의 critic 손실을 계산합니다.  
+- **configs/\*.yaml**: 실험을 코드 수정 없이 바꾸도록 분리(환경/모델/훈련 하이퍼).  
+- **envs/container_sim.py**: 높이맵 기반 쌓기·충돌·경계·지지면(안정성) 규칙을 적용하고, 보상 r = g_{i-1} − g_i 및 활용률(UR)을 계산합니다.  
+- **results/**: 학습 산출물 표준 경로(재현성·중단복구).  
+- **tests/**: 각 컴포넌트별 최소 보증(스모크+shape+확률합+수치 검증).  
+- **train/train_ppo.py**: PPO 루프(수집→업데이트→로그), 체크포인트 네이밍 규칙과 자동 재개 우선순위(pre→post→milestone) 포함.  
+- **utils/preprocess.py**: 경계/에지/높이 등 7채널 plane features와 패치 다운샘플(100×100×7→10×10×7→flatten 100×7).  
+- **requirements-\*.txt**: 환경 재현용 의존성 핀 고정.  
+
 ---
 
 ## 🧪 Environment & Setup
