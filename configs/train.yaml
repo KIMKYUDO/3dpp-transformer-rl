@@ -13,8 +13,8 @@ optimizer:
   weight_decay: 0.0
 
 schedule:
-  num_updates: 5
-  epochs_per_update: 4
+  num_updates: 10000
+  epochs_per_update: 1
   batch_size: 32
   log_interval: 50
-  save_interval: 500
+  save_interval: 2

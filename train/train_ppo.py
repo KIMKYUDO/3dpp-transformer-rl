@@ -32,6 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
 # Local imports
 from envs.container_sim import PackingEnv, EnvConfig
 from utils.preprocess import compute_plane_features, downsample_patches, flatten_for_encoder
+from utils.logger import resolve_resume
+from utils.rng_state import get_rng_state, set_rng_state
 from agents.backbone import PolicyBackbone, EncoderConfig
 from agents.heads import (
     PositionDecoder, SelectionDecoder, OrientationDecoder,
@@ -260,30 +262,26 @@ def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor
 def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
     """
     - results/logs/{run_name}.csv 에 append
-    - 파일이 이미 있으면 마지막 global_update를 읽어 offset으로 사용
     - 없으면 헤더 작성 후 offset=0
     """
     log_dir = os.path.join("results", "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"{run_name}.csv")
 
-    header = ["run","ts","update","global_update","T","return_sum","mean_UR","actor_loss","critic_loss","entropy"]
+    header = ["run","ts","update","T","return_sum","mean_UR","actor_loss","critic_loss","entropy"]
     offset = 0
     file_exists = os.path.exists(log_path) and os.path.getsize(log_path) > 0
 
     if file_exists:
-        # 마지막 global_update 값을 찾는다 (없으면 update의 최대값 사용)
-        last_global = None
         last_update = 0
         with open(log_path, "r", newline="") as f:
             rd = csv.DictReader(f)
             for row in rd:
                 try:
-                    last_update = int(row.get("global_update") or row.get("update") or last_update)
-                    last_global = last_update
+                    last_update = int(row.get("update") or last_update)
                 except Exception:
                     continue
-        offset = (last_global or 0)
+        offset = (last_update or 0)
         f = open(log_path, "a", newline="")
         w = csv.writer(f)
     else:
@@ -300,7 +298,11 @@ def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
 def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
     dprint(f"[init] num_updates={cfg.num_updates}, epochs_per_update={cfg.epochs_per_update}, batch_size={cfg.batch_size}")
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
-    np.random.default_rng(cfg.seed)
+    
+    # --- RNG 초기화 (처음 한 번만) ---
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device)
 
@@ -318,9 +320,26 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
     optim_actor = torch.optim.Adam(policy.parameters(), lr=cfg.lr_actor)
     optim_critic = torch.optim.Adam(value.parameters(), lr=cfg.lr_critic)
 
+
+    # === Resume-safe 학습 초기화 ===
+    last_milestone, ckpt_path = resolve_resume(cfg, run_name, log_path)
+    if last_milestone > 0 and ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        policy.load_state_dict(ckpt['policy'])
+        value.load_state_dict(ckpt['value'])
+        optim_actor.load_state_dict(ckpt['optim_actor'])
+        optim_critic.load_state_dict(ckpt['optim_critic'])
+        set_rng_state(ckpt['rng_state'])
+        start_update = last_milestone + 1
+        dprint(f"[resume] from {ckpt_path}, start_update={start_update}")
+
+    else:
+        start_update = 1
+        dprint("[resume] no checkpoint found — start from scratch")
+    
     dprint("[start] training loop")
     try:
-        for update in range(1, cfg.num_updates + 1):
+        for update in range(start_update, cfg.num_updates + 1):
             dprint(f"[loop] update {update}/{cfg.num_updates} start")
 
             # Rollout buffers (episode length ≤ N)
@@ -504,9 +523,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # CSV 로그 기록 (누적)
             try:
-                global_update = base_offset + update
                 csv_w.writerow([
-                    run_name, session_tag, update, global_update, T,
+                    run_name, session_tag, update, T,
                     f"{return_sum:.4f}", f"{final_ur:.6f}",
                     f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_bonus.item():.6f}"
                 ])
@@ -516,16 +534,23 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # Save minimal checkpoint (save_interval 반영)
             if update % cfg.save_interval == 0:
-                ckpt_path = os.path.join(cfg.ckpt_dir, f'{run_name}_u{global_update:05d}.pt')
+                ckpt_path = os.path.join(cfg.ckpt_dir, f'{run_name}_u{update:05d}.pt')
                 torch.save({
                     'policy': policy.state_dict(),
                     'value': value.state_dict(),
+                    'optim_actor': optim_actor.state_dict(),
+                    'optim_critic': optim_critic.state_dict(),
+                    "rng_state": get_rng_state(),
                     'cfg': cfg.__dict__,
                     'env_cfg': env_cfg.__dict__,
                 }, ckpt_path)
                 dprint(f"[save] ckpt saved to: {ckpt_path}")
 
         dprint("[done] training loop complete")
+
+    except KeyboardInterrupt:
+        dprint("[interrupt] Training interrupted by user (Ctrl+C)")
+        dprint(f"[save] interrupted ckpt saved: {ckpt_path}")
 
     except Exception:
         dprint("[fatal] exception in training loop")
@@ -541,12 +566,11 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
         if MATPLOTLIB_OK:
             try:
                 updates, rets, urs = [], [], []
-                # global_update가 있으면 그 축으로, 없으면 update 사용
                 with open(log_path, "r", newline="") as f:
                     rd = csv.DictReader(f)
                     for row in rd:
                         try:
-                            x = int(row.get("global_update") or row.get("update"))
+                            x = int(row.get("update"))
                             updates.append(x)
                             rets.append(float(row["return_sum"]))
                             urs.append(float(row["mean_UR"]))
@@ -559,7 +583,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                 plt.figure()
                 plt.plot(updates, rets)
                 plt.title(f"Return (sum per update) — {run_name}")
-                plt.xlabel("global_update"); plt.ylabel("return_sum")
+                plt.xlabel("update"); plt.ylabel("return_sum")
                 plt.tight_layout()
                 ret_png = os.path.join(out_dir, f"{run_name}_return.png")
                 plt.savefig(ret_png, dpi=150)
@@ -568,7 +592,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                 plt.figure()
                 plt.plot(updates, urs)
                 plt.title(f"Utilization Rate — {run_name}")
-                plt.xlabel("global_update"); plt.ylabel("UR")
+                plt.xlabel("update"); plt.ylabel("UR")
                 plt.tight_layout()
                 ur_png = os.path.join(out_dir, f"{run_name}_ur.png")
                 plt.savefig(ur_png, dpi=150)
