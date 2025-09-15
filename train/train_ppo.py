@@ -139,19 +139,19 @@ class PolicyNet(nn.Module):
         box_enc, cont_enc = self.backbone(boxes, cont_flat)  # (B,N,d), (B,100,d)
 
         # 1) Position
-        logp_pos, logits_pos, ctx = self.pos_dec(cont_enc, box_enc)  # (B,100), (B,100,d)
+        logits_pos, ctx = self.pos_dec(cont_enc, box_enc)  # (B,100), (B,100,d)
 
         # 2) Sample position index
         dist_p = Categorical(logits=logits_pos)
         pos_idx = dist_p.sample()                   # (B,)
-        pos_logp = logp_pos.gather(1, pos_idx.view(-1,1)).squeeze(1)
+        pos_logp = F.log_softmax(logits_pos, dim=-1).gather(1, pos_idx.view(-1,1)).squeeze(1)
         pos_entropy = dist_p.entropy()
 
         # 3) Position embedding
         pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)   # (B,1,d)
 
         # 4) Selection (mask out used boxes)
-        logp_sel, logits_sel, _ = self.sel_dec(box_enc, pos_emb)   # (B,N)
+        logits_sel, _ = self.sel_dec(box_enc, pos_emb)   # (B,N)
         logits_sel = logits_sel.masked_fill(used_mask, float('-inf'))
         dist_s = Categorical(logits=logits_sel)
         sel_idx = dist_s.sample()                 # (B,)
@@ -163,18 +163,17 @@ class PolicyNet(nn.Module):
         gather_idx = sel_idx.view(B,1,1).expand(-1,1,3)  # (B,1,3)
         picked_lwh = boxes.gather(1, gather_idx).squeeze(1)  # (B,3)
         orient_emb = self.orient_embed(picked_lwh)  # (B,6,d)
-        logp_or, logits_or, _ = self.orient_dec(orient_emb, pos_emb)  # (B,6)
+        logits_or, _ = self.orient_dec(orient_emb, pos_emb)  # (B,6)
 
         # ---- 유효 오리엔테이션 개수(1/3/6)로 마스킹 ----
         n_valid = self._num_valid_orients(picked_lwh)          # (B,)
         ar6 = torch.arange(6, device=logits_or.device).view(1, 6).expand(B, -1)
         valid_mask = ar6 < n_valid.unsqueeze(1)                 # True=valid
-        masked_logits_or = logits_or.clone()
-        masked_logits_or[~valid_mask] = -1e9                    # invalid -> -inf
+        logits_or = logits_or.masked_fill(~valid_mask, float('-inf'))
 
-        dist_o = Categorical(logits=masked_logits_or)
+        dist_o = Categorical(logits=logits_or)
         orient_idx = dist_o.sample()                            # (B,)
-        orient_logp = F.log_softmax(masked_logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
+        orient_logp = F.log_softmax(logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
         orient_entropy = dist_o.entropy()
         # -----------------------------------------------
 
@@ -207,7 +206,7 @@ class PolicyNet(nn.Module):
 
         pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)
 
-        logp_sel, logits_sel, _ = self.sel_dec(box_enc, pos_emb)
+        logits_sel, _ = self.sel_dec(box_enc, pos_emb)
         logits_sel = logits_sel.masked_fill(used_mask, float('-inf'))
         sel_logp = F.log_softmax(logits_sel, dim=-1).gather(1, sel_idx.view(-1,1)).squeeze(1)
         dist_s = Categorical(logits=logits_sel)
@@ -218,16 +217,15 @@ class PolicyNet(nn.Module):
         gather_idx = sel_idx.view(B,1,1).expand(-1,1,3)
         picked_lwh = boxes.gather(1, gather_idx).squeeze(1)     # (B,3)
         orient_emb = self.orient_embed(picked_lwh)
-        logp_or, logits_or, _ = self.orient_dec(orient_emb, pos_emb)
+        logits_or, _ = self.orient_dec(orient_emb, pos_emb)
 
         n_valid = self._num_valid_orients(picked_lwh)          # (B,)
         ar6 = torch.arange(6, device=logits_or.device).view(1, 6).expand(B, -1)
         valid_mask = ar6 < n_valid.unsqueeze(1)
-        masked_logits_or = logits_or.clone()
-        masked_logits_or[~valid_mask] = -1e9
+        logits_or = logits_or.masked_fill(~valid_mask, float('-inf'))
 
-        orient_logp = F.log_softmax(masked_logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
-        dist_o = Categorical(logits=masked_logits_or)
+        orient_logp = F.log_softmax(logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
+        dist_o = Categorical(logits=logits_or)
         orient_ent = dist_o.entropy()
 
         total_logp = pos_logp + sel_logp + orient_logp
