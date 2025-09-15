@@ -42,8 +42,7 @@ class PositionDecoder(nn.Module):
         # cont_enc: (B,100,d), box_enc: (B,N,d)
         h = self.dec(cont_enc, box_enc)          # (B,100,d)
         logits = self.fc(h).squeeze(-1)          # (B,100)
-        logp = F.log_softmax(logits, dim=-1)     # (B,100)
-        return logp, logits, h                   # h는 pos-embedding 생성을 위한 컨텍스트
+        return logits, h                   # h는 pos-embedding 생성을 위한 컨텍스트
 
 
 class PositionEmbeddingBuilder(nn.Module):
@@ -80,8 +79,7 @@ class SelectionDecoder(nn.Module):
         # box_enc: (B,N,d), pos_emb: (B,1,d)
         h = self.dec(box_enc, pos_emb)            # (B,N,d)
         logits = self.fc(h).squeeze(-1)           # (B,N)
-        logp = F.log_softmax(logits, dim=-1)
-        return logp, logits, h
+        return logits, h
 
 
 class OrientationDecoder(nn.Module):
@@ -94,8 +92,7 @@ class OrientationDecoder(nn.Module):
         # orient_emb: (B,6,d), pos_emb: (B,1,d)
         h = self.dec(orient_emb, pos_emb)         # (B,6,d)
         logits = self.fc(h).squeeze(-1)           # (B,6)
-        logp = F.log_softmax(logits, dim=-1)
-        return logp, logits, h
+        return logits, h
 
 
 class OrientationEmbedder(nn.Module):
