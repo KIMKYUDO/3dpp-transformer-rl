@@ -1,7 +1,17 @@
-numpy>=1.23
-pyyaml>=6.0
-pytest>=7.0
-torch==2.8.0+cpu       # CPU 전용 PyTorch
-tensorboard>=2.12      # 로그/시각화용 (선택)
-matplotlib>=3.7        # 결과 플롯 저장 (선택)
-tqdm>=4.66             # 학습 진행바 (선택)
+# === Core Deep Learning ===
+torch==2.8.0           # CPU-only PyTorch
+
+# === Array & Math ===
+numpy==1.26.4
+scipy==1.14.1
+
+# === Data & Utils ===
+pyyaml==6.0.2
+tqdm==4.66.5
+
+# === Visualization ===
+matplotlib==3.9.2
+tensorboard>=2.12      # for logging/visualization (optional)
+
+# === Testing ===
+pytest==8.3.3
