@@ -16,5 +16,5 @@ schedule:
   num_updates: 10000
   epochs_per_update: 1
   batch_size: 32
-  log_interval: 50
+  log_interval: 2
   save_interval: 2

@@ -23,6 +23,7 @@ class EnvConfig:
     w_range: Tuple[int, int] = (10, 50)
     h_range: Tuple[int, int] = (10, 50)
     seed: Optional[int] = None
+    invalid_penalty: float = -1.0
 
 
 class PackingEnv:
@@ -46,6 +47,9 @@ class PackingEnv:
         self.t = 0
         self._sum_vol = 0  # \sum lwh for placed boxes
         self._g_prev = 0   # g_{i-1}
+        self.placed_boxes = []   # (x,y,z,l,w,h) 튜플 기록
+        self.invalid_penalty = cfg.invalid_penalty
+        self.invalid_count = 0
 
     # ---------- 유틸 ----------
     @staticmethod
@@ -79,6 +83,7 @@ class PackingEnv:
         self.t = 0
         self._sum_vol = 0
         self._g_prev = 0
+        self.placed_boxes = []   # 새로운 에피소드마다 초기화
         if boxes is None:
             self.boxes = self._sample_boxes()
         else:
@@ -127,7 +132,33 @@ class PackingEnv:
 
         # 지지면: 해당 영역의 현재 최대 높이 위에 올린다 (스텝함수 높이맵).
         top = self._max_height_in_region(x, y, l2, w2)
+
+        # 안정성 체크 (지지면 비율)
+        region = self.height[y:y+w2, x:x+l2]
+        support = (region == top)
+        support_ratio = support.sum() / (l2 * w2)
+        alpha = 0.5   # 임계값 (절반 이상 닿아야 안정)
+
+        if support_ratio < alpha:
+            self.invalid_count += 1
+            reward = self.invalid_penalty
+            done = self.invalid_count > 10
+            info = {"invalid": True, "unstable": True, "support_ratio": float(support_ratio)}
+            if done:
+                info["invalid_limit_reached"] = True   # ✅ invalid 10회 초과 표시
+                print(f"[WARNING] invalid_count exceeded 10 at step {self.t}")
+            obs = {
+                "height": self.height.copy(),
+                "remaining": (~self.used).sum(),
+                "gap": self._gap()
+            }
+            return obs, reward, done, info
+        else:
+            self.invalid_count = 0  # 안정적으로 놓았으므로 초기화
         self._raise_region(x, y, l2, w2, top, h2)
+
+        # 예: 박스를 (x,y,z)에 배치, 크기 (l,w,h)
+        self.placed_boxes.append((x, y, top, l2, w2, h2))
 
         # 누적 부피/단계 증가
         self.used[bidx] = True
@@ -150,7 +181,11 @@ class PackingEnv:
             "remaining": (~self.used).sum(),
             "gap": g_now,
         }
+        print(f"[DEBUG] step: placed={len(self.placed_boxes)}, remaining={(~self.used).sum()}, done={done}")
         return obs, reward, done, info
+    
+    def current_max_height(self):
+        return int(self.height.max())
 
     # 선택: 정책 입력용 컨테이너 상태 7채널
     def container_state7(self) -> Optional[np.ndarray]:
