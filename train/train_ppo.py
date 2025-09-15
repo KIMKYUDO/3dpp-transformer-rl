@@ -199,8 +199,8 @@ class PolicyNet(nn.Module):
                          sel_idx: torch.Tensor,
                          orient_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         box_enc, cont_enc = self.backbone(boxes, cont_flat)
-        logp_pos, logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
-        pos_logp = logp_pos.gather(1, pos_idx.view(-1,1)).squeeze(1)
+        logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
+        pos_logp = F.log_softmax(logits_pos, dim=-1).gather(1, pos_idx.view(-1,1)).squeeze(1)
         dist_p = Categorical(logits=logits_pos)
         pos_ent = dist_p.entropy()
 
@@ -362,10 +362,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     sel_idx = out['sel_idx']           # (1,)
                     orient_idx = out['orient_idx']     # (1,)
                     logp = out['logp']                 # (1,)
-
-                # Map pos index (0..99) → (x,y) in 100x100 grid (upper-left of the 10x10 patch)
-                xy = policy._pos_index_to_xy(pos_idx).cpu().numpy()[0]
-                x, y = int(xy[0]), int(xy[1])
+                    # Map pos index (0..99) → (x,y) in 100x100 grid (upper-left of the 10x10 patch)
+                    x, y = map(int, out['xy'].cpu().numpy()[0])
 
                 # Step env
                 obs, reward, done, info = env.step((x, y, int(sel_idx.item()), int(orient_idx.item())))
@@ -393,11 +391,11 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             return_sum = float(sum([r.item() for r in traj['rewards']]))
             try:
                 ur = env.utilization_rate() if callable(getattr(env, "utilization_rate", None)) else float(getattr(env, "utilization_rate", 0.0))
-                mean_ur = float(ur)
+                final_ur = float(ur)
             except Exception:
-                mean_ur = 0.0
+                final_ur = 0.0
 
-            dprint(f"[collect] trajectories ready | T={t} | return={return_sum:.2f} | UR={mean_ur:.4f}")
+            dprint(f"[collect] trajectories ready | T={t} | return={return_sum:.2f} | UR={final_ur:.4f}")
 
             # 빈 롤아웃 방지
             if t == 0:
@@ -509,7 +507,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                 global_update = base_offset + update
                 csv_w.writerow([
                     run_name, session_tag, update, global_update, T,
-                    f"{return_sum:.4f}", f"{mean_ur:.6f}",
+                    f"{return_sum:.4f}", f"{final_ur:.6f}",
                     f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_bonus.item():.6f}"
                 ])
                 csv_f.flush()

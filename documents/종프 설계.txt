@@ -1,0 +1,112 @@
+총 목표: 2개의 입력을 받아 3개의 최적의 출력값을 도출하는 기계 만들기
+
+0: 환경 구성
+1, 2: 알고리즘 구성
+3: 모델 구현(code)
+
+
+ 0. 세팅 -> 레포지토리 생성, 규약 설정, 기본 KPI(핵심 성과 지표) 정의
+
+*
+리포지토리 생성: envs/, agents/, train/, configs/, results/, viz/
+공통 규약 확정: 좌표계(x,y,z), 단위(mm or cm), 격자 해상도(예: 30×30)
+기본 KPI 정의: UR(공간 활용률)↑, 충돌률=0, 평균높이↓, 스텝당 시간(ms)
+
+ 1. 시뮬레이터 : 상자를 놓을 수 있는지 확인하는 단계
+heightmap, AABB 함수 사용: 이미 놓여진 상자의 경계값 <- 상자의 위치를 정하기 위함
+액션 적용 API: 선택된 위치에 상자를 놓을수 있는지 없는지
+무작위 박스 인스턴스 생성기
+
+*
+heightmap 기반 컨테이너 표현(바닥 2D 격자 + 칸별 높이)
+AABB 충돌·경계·지지면(접촉면적≥θ) 검사 함수
+액션 적용 API: place(box_id, rot, x, y) → success/fail + new_state
+무작위 박스 인스턴스 생성기(분포: 균등/로그정규 선택 가능)
+
+ 2. 베이스라인 & 모사데이터 : KPI를 높이기 위한 방식을 학습하는 단계
+베이스라인: 박스를 가능한 위치에 무작위로 넣었을 때 도출되는 평균 KPI
+모사데이터: 행동 로그
+휴리스틱: 박스의 위치를 지정하거나 순서를 정하는 방식
+휴리스틱 궤적 행동 로그 수집
+베이스라인 UR 측정(각 컨테이너 크기마다)
+
+*
+휴리스틱 구현: First-Fit-Decreasing(FFD)-크기 정렬 후 쌓기, Layer-building-아래층에 놓을 수 없을 때 윗층 쌓기(무작위 순서)
+휴리스틱 궤적: 박스 순서/회전/좌표
+
+ 3. 모델 스켈레톤: 뼈대 코드 <- 입·출력 흐름과 모듈의 최소 구현
+목적: 세부 성능튜닝 전, "데이터 -> 인코더 -> 백본 -> 디코더 -> 손실이 한 번에 끝까지 돈다"를 검증.
+
+주요 개념
+Transformer: 토큰(입력 기본 단위)들이 서로를 참고해서 중요한 것만 골라보는(attention) 연산을, 여러 번 반복하는 구조
+(transformer 이미지)
+
+Attention: 입력 토큰들 간에 "누굴 얼마나 참고할지"를 계산하는 연산 - Transformer의 핵심 부품
+=> Self-Attention, Cross-Attention
+
+Transformer 기본 구조: 입력 토큰 -> Self-Attention -> FFN(MLP, 비선형 변환) -> Residual + LayerNorm -> 반복
+
+
+기계: Box Encoder, Container Encoder -> Backbone -> Box select Decoder, Placement Decoder, Value Decoder
+
+Box Encoder: Set-transformer(기본 구조와 같음, 순서 불필요)
+Container Encoder: Patchifying+Transformer
+Backbone: Self-Attention 대신 Cross-Attention을 사용한 transformer(Box와 Container를 cross해서 관계를 입력)
+Box select Decoder(Pointer): Cross-Attention+softmax
+Placement Decoder: Cross-Attention+MLP+softmax->회전 Head, 좌표 Head
+Value Decoder: 박스 인코더 + 컨테이너 인코더 + Backbone 출력 -> MLP 2~3층(보통 Attention은 안 씀, 가볍게 설계) + Dense(1)
+
+
+*
+Set-Transformer: 입력 순서가 달라도 같은 출력을 내도록 설계
+Masked Softmax: 불가능한 박스/위치/회전을 확률 분포에서 제거
+구체적인 동작 방식:
+1. raw logits 출력 (예: 좌표 40×40 = 1600개)
+2. 마스크 배열 생성: [아직 안 쓴 박스 = 1, 이미 쓴 박스 = 0], [가능 위치 = 1, 불가능 위치 = 0], [가능한 회전 = 1, 불가능 회전 = 0]
+3. logits += log(mask) (log(0) = -∞)
+4. softmax 연산 시 확률 0
+
+
+
+ 4. Behavioral Cloning Pre-training: 정책을 학습하는 RL, 완전히 랜덤한 정책 대신 **휴리스틱 알고리즘**으로 쌓은 궤적을 지도학습처럼 흉내내서, 모델을 "기본기" 있는 정책 상태로 만들기 -> Transformer의 가중치를 휴리스틱 행동 분포에 맞추어 학습
+
+똑같이 Transformer 구조
+
+데이터 수집 -> 입력/출력 정의 -> 손실 함수 설계 -> 학습 -> RL 전환
+
+1. 데이터 수집: 휴리스틱 알고리즘으로 여러 번 시뮬레이션 돌려 로그 저장 -> 잠깐 지도학습에서 사용될 정답 데이터셋
+
+2. 입력/출력 정의
+· 입력: Box Encoder(남은 박스 정보), Containrer Encoder(박스가 쌓인 컨테이너 상태)
+· 출력: Box select Decoder(Pointer 확률 분포), Placement Decoder
+
+3. 손실 함수 설계
+Cross-Entropy Loss
+L_box = CE(pred_box_probs, true_box_id)
+L_rot = CE(pred_rot_probs, true_rot_class)
+L_coord = CE(pred_xy_probs, true_xy_class)
+
+L_total = L_box + L_rot + L_coord(가중치 조정 가능)
+
+4. 학습
+Optimizer: Adam (lr=3e-4)
+Batch size: 32~128 (로그에서 샘플링)
+Epoch: 수천 스텝 (수만 로그면 충분)
+학습이 끝나면, 모델은 휴리스틱 수준의 정책을 복제한 상태가 됨.
+
+5. RL 전환
+
+
+토큰이란? 기본 입력 단위(ex. 단어, ..)
+
+embeding
+· 트랜스포머는 토큰마다 동일한 차원이어야함 EX) (B, N, d_model), (B, P, d_model)
+ => Box Encoder dim = Container Encoder dim = d_model
+· 연속형: (w,l,h,weight)-> 정규화 -> Linear(4→64)→ReLU→Linear(64→d_model)
+· 범주형: box_type_id, fragile_flag(원-핫) -> 이론: 임베딩 테이블과 내적/실제: 임베딩 테이블의 행 인덱싱
+· 여러 특징을 **같은 차원으로 합성** 가능 -> 합성하더라도 각 특징은 서로 다른 서브스페이스를 갖기에 attention에서 **분리 가능**
+원리 및 예시 => 3d_nonorthogonal_example.txt
+=> 어텐션에서 각 특징을 분리할 수 있게 학습파라미터(W_Q)를 학습.
+
+
+
