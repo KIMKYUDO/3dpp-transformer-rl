@@ -1,3 +1,15 @@
+# 2025-2학기 경북대학교
+
+## 프로젝트 개요
+- 강화학습 기반 3D 컨테이너 적재 최적화 시스템 개발
+  - 3D 포장 문제 정의 및 환경 구성
+  - 트랜스포머 기반 강화학습 에이전트 학습
+  - 시뮬레이션 및 시각화 기반 실험 수행
+
+## 프로젝트 문서
+- 프로젝트 문서는 아래 Notion 페이지에서 정리합니다.
+- Notion : https://www.notion.so/returnall/2025-2-26adad4051a680a7bedfd65b457deed5?source=copy_link
+
 # Transformer-based 3D Container Packing with PPO (ReturnAll 협업)
 
 강화학습(PPO)과 트랜스포머 정책망으로 3D 컨테이너 적재(가변 높이)를 최적화하는 프로젝트입니다. 목표 지표는 **공간 활용률(UR)** 극대화이며, 논문 *"Solving 3D packing problem using Transformer network and reinforcement learning" (Que et al., ESWA 2023)*의 핵심 아이디어(상태 표현, **Plane Features**, **Action Order**, **Downsampling**)를 구현했습니다.

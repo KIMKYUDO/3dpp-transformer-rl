@@ -34,7 +34,7 @@ from envs.container_sim import PackingEnv, EnvConfig
 from utils.preprocess import compute_plane_features, downsample_patches, flatten_for_encoder
 from utils.logger import resolve_resume
 from utils.rng_state import get_rng_state, set_rng_state
-from utils.plotting import save_packing_3d
+from utils.plotting import save_packing_3d, save_packing_3d_interactive
 from agents.backbone import PolicyBackbone, EncoderConfig
 from agents.heads import (
     PositionDecoder, SelectionDecoder, OrientationDecoder,
@@ -408,11 +408,10 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                 t += 1
             
             if update % cfg.log_interval == 0:
-                save_packing_3d(
-                    env.placed_boxes,
-                    container=(env.L, env.W, env.current_max_height()),
-                    out_path=f"results/plots/packing_ep{update:05d}.png"
-                )
+                boxes = env.placed_boxes  # <- 현재까지 적재된 박스 정보 (x,y,z,l,w,h)
+                out_base = f"results/plots/packing_u{update:05d}"
+                save_packing_3d(boxes, container=(L,W,env.current_max_height()), out_path=out_base+".png")
+                save_packing_3d_interactive(boxes, container=(L,W,env.current_max_height()), out_path=out_base+".html")
 
             # 에피소드 통계
             return_sum = float(sum([r.item() for r in traj['rewards']]))
