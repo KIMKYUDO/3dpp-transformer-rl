@@ -96,17 +96,19 @@ class PackingEnv:
         }
         return obs
 
-    def _sample_boxes(self) -> List[Box]:
-        Lr = self.cfg.l_range
-        Wr = self.cfg.w_range
-        Hr = self.cfg.h_range
-        boxes = []
-        for _ in range(self.cfg.N):
-            l = int(self.rng.integers(Lr[0], Lr[1] + 1))
-            w = int(self.rng.integers(Wr[0], Wr[1] + 1))
-            h = int(self.rng.integers(Hr[0], Hr[1] + 1))
-            boxes.append((l, w, h))
-        return boxes
+   def _sample_boxes(self) -> List[Box]:
+    L, W = self.cfg.L, self.cfg.W
+    l_range = (int(L/10), int(L/2))
+    w_range = (int(W/10), int(W/2))
+    h_range = (int(min(L, W)/10), int(max(L, W)/2))
+    
+    boxes = []
+    for _ in range(self.cfg.N):
+        l = int(self.rng.integers(l_range[0], l_range[1] + 1))
+        w = int(self.rng.integers(w_range[0], w_range[1] + 1))
+        h = int(self.rng.integers(h_range[0], h_range[1] + 1))
+        boxes.append((l, w, h))
+    return boxes
 
     def step(self, action: Tuple[int, int, int, int]):
         """Place a box with action (x, y, box_idx, orient_idx).
