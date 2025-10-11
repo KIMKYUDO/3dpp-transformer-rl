@@ -1,11 +1,41 @@
 # utils/plotting.py
 
+# --- backend 선택 & GUI import 가드 ---
+USE_GUI = False
+
 import os
-import matplotlib.pyplot as plt
+
+if USE_GUI:
+    os.environ.pop("MPLBACKEND", None)
+    import matplotlib
+    matplotlib.use("TkAgg", force=True)
+    import tkinter as tk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+else:
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+
+# === plotting (자동 저장) ===
+try:
+    import matplotlib.pyplot as plt
+    if not USE_GUI:
+        plt.ioff()  # 인터랙티브 off
+    import atexit
+    atexit.register(lambda: plt.close('all'))
+    MATPLOTLIB_OK = True
+except Exception:
+    MATPLOTLIB_OK = False
+    plt = None
+
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.cm as cm
 import numpy as np
-import plotly.graph_objects as go
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except Exception:
+    HAS_PLOTLY = False
 
 
 # =====================

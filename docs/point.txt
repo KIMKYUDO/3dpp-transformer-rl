@@ -50,11 +50,11 @@ import traceback
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, cast
 from typing import Tuple as _TupleForObs
-from collections import Counter
 
 import yaml
 import numpy as np
 import torch
+from torch import profiler
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -75,7 +75,6 @@ from utils.preprocess import compute_plane_features, downsample_patches, flatten
 from utils.logger import resolve_resume
 from utils.rng_state import get_rng_state, set_rng_state
 from utils.plotting import save_packing_3d, save_packing_3d_interactive
-from utils.curriculum_scheduler import CurriculumScheduler
 from agents.backbone import PolicyBackbone, EncoderConfig
 from agents.heads import (
     PositionDecoder, SelectionDecoder, OrientationDecoder,
@@ -152,9 +151,6 @@ class TrainConfig:
     save_interval: int = 1        # train.yaml의 save_interval 반영 (기본 1)
     # AMP
     grad_accum_steps: int = 1   # 그래디언트 누적 스텝 (메모리 부족 시 >1로 설정)
-    # Debug / Reason logging
-    log_done_reasons_every: int = 1   # 매 몇 update마다 요약 출력할지
-    print_first_k_done: int = 256      # 조기 종료 샘플 상세 로그 개수 제한
 
 # ------------------------------------------------------------
 # YAML 로더 유틸
@@ -205,240 +201,71 @@ class PolicyNet(nn.Module):
               torch.where(any_pair, torch.tensor(3, device=l.device),
                           torch.tensor(6, device=l.device)))
         return out
-    
-    def _compute_valid_position_mask(self,
-                                     boxes: torch.Tensor,      # (B,N,3)
-                                     used_mask: torch.Tensor,  # (B,N) bool
-                                     container_L: int = 100,
-                                     container_W: int = 100,
-                                     patch: int = 10) -> torch.Tensor:
-        B, N, _ = boxes.shape
-        device = boxes.device
-
-        # 1) 100개 위치 그리드 생성 (x, y 순서로 통일)
-        x_coords = torch.arange(0, container_L, patch, device=device)  # 10개
-        y_coords = torch.arange(0, container_W, patch, device=device)  # 10개
-        
-        # (100, 2) with (x, y) 순서
-        grid = torch.stack([
-            x_coords.repeat_interleave(len(y_coords)),
-            y_coords.repeat(len(x_coords))
-        ], dim=1)  # (100, 2) - (x, y)
-
-        remaining_L = (container_L - grid[:, 1]).view(1, 1, 1, 100)  # (1,1,1,100)
-        remaining_W = (container_W - grid[:, 0]).view(1, 1, 1, 100)  # (1,1,1,100)
-
-        # 2) 6가지 회전의 2D 풋프린트 (l,w) 쌍을 전부 생성
-        l, w, h = boxes[..., 0], boxes[..., 1], boxes[..., 2]          # (B,N)
-        pairs = torch.stack([
-            torch.stack([l, w], dim=-1),
-            torch.stack([l, h], dim=-1),
-            torch.stack([w, l], dim=-1),
-            torch.stack([w, h], dim=-1),
-            torch.stack([h, l], dim=-1),
-            torch.stack([h, w], dim=-1),
-        ], dim=2)  # (B,N,6,2)
-
-        # 3) 이미 사용된 박스는 아주 크게 만들어 제외
-        if used_mask is not None:
-            mask = used_mask.unsqueeze(-1).unsqueeze(-1)          # (B,N,1,1)
-            pairs = pairs.masked_fill(mask, 99999)
-
-        # 4) 위치별 적합성: (pl<=remL & pw<=remW)
-        pL = pairs[..., 0].unsqueeze(-1)   # (B,N,6,1)
-        pW = pairs[..., 1].unsqueeze(-1)   # (B,N,6,1)
-
-        fits = (pL <= remaining_L) & (pW <= remaining_W)  # (B,N,6,100)
-
-        # 5) 박스/회전 중 하나라도 맞으면 그 위치는 유효
-        valid_mask = fits.any(dim=2).any(dim=1)  # (B,100)
-
-        # 6) 모든 박스 사용된 배치는 False
-        all_used = used_mask.all(dim=-1)  # (B,)
-        valid_mask[all_used] = False
-
-        return valid_mask
-    
-    def _compute_valid_selection_mask(self,
-                                      boxes: torch.Tensor,       # (B, N, 3)
-                                      used_mask: torch.Tensor,   # (B, N)
-                                      pos_xy: torch.Tensor,      # (B, 2) - 선택된 위치
-                                      container_L: int = 100,
-                                      container_W: int = 100) -> torch.Tensor:
-        """선택 유효성: pos_xy 위치에 들어갈 수 있는 박스만
-        
-        Returns: (B, N) bool mask (True = 선택 가능)
-        """
-        B, N, _ = boxes.shape
-        device = boxes.device
-        
-        valid_mask = ~used_mask  # 기본: 미사용 박스만
-        
-        x = pos_xy[:, 0]  # (B,)
-        y = pos_xy[:, 1]  # (B,)
-        
-        # 남은 공간 계산
-        remaining_L = container_L - x  # (B,)
-        remaining_W = container_W - y  # (B,)
-        
-        for b in range(B):
-            if remaining_L[b] <= 0 or remaining_W[b] <= 0:
-                # 경계 밖이면 모든 박스 무효
-                valid_mask[b, :] = False
-                continue
-
-            for n in range(N):
-                if used_mask[b, n]:
-                    continue
-                
-                l, w, h = boxes[b, n]
-                
-                # 6가지 회전 중 **하나라도** 들어가면 OK
-                can_fit = False
-                for perm in [(l,w), (l,h), (w,l), (w,h), (h,l), (h,w)]:
-                    pl, pw = perm[0], perm[1]
-                    if pl <= remaining_L[b] and pw <= remaining_W[b]:
-                        can_fit = True
-                        break
-                
-                if not can_fit:
-                    valid_mask[b, n] = False
-        
-        return valid_mask
-    
-    def _compute_valid_orientation_mask(self,
-                                        box_lwh: torch.Tensor,     # (B, 3)
-                                        pos_xy: torch.Tensor,      # (B, 2)
-                                        container_L: int = 100,
-                                        container_W: int = 100) -> torch.Tensor:
-        """회전 유효성: 경계 체크만 수행 (중복 제거 안 함)
-        
-        중복 회전은 동일한 결과이므로 제거할 필요 없음.
-        오히려 All -inf 방지에 도움.
-        
-        Returns: (B, 6) bool mask
-        """
-        B = box_lwh.shape[0]
-        device = box_lwh.device
-        
-        l, w, h = box_lwh[:, 0], box_lwh[:, 1], box_lwh[:, 2]
-        x, y = pos_xy[:, 0], pos_xy[:, 1]
-        
-        remaining_L = container_L - x
-        remaining_W = container_W - y
-        
-        # 6가지 회전 모두 경계 체크 (중복 제거 생략)
-        perms = [
-            torch.stack([l, w, h], dim=1),  # 0: (l,w,h)
-            torch.stack([l, h, w], dim=1),  # 1: (l,h,w)
-            torch.stack([w, l, h], dim=1),  # 2: (w,l,h)
-            torch.stack([w, h, l], dim=1),  # 3: (w,h,l)
-            torch.stack([h, l, w], dim=1),  # 4: (h,l,w)
-            torch.stack([h, w, l], dim=1),  # 5: (h,w,l)
-        ]
-        
-        valid_mask = torch.zeros(B, 6, dtype=torch.bool, device=device)
-        for i, perm in enumerate(perms):
-            pl, pw = perm[:, 0], perm[:, 1]
-            # 경계 내부 체크
-            fits_L = (pl <= remaining_L) & (remaining_L > 0)
-            fits_W = (pw <= remaining_W) & (remaining_W > 0)
-            valid_mask[:, i] = fits_L & fits_W
-
-        
-        return valid_mask
 
     def forward_decode(self,
                        boxes: torch.Tensor,          # (B,N,3)
                        cont_flat: torch.Tensor,      # (B,100,7)
                        raw_flat: torch.Tensor,       # (B,100,7) same as cont_flat before proj
-                       used_mask: torch.Tensor,      # (B,N) bool
-                       env_config: EnvConfig = EnvConfig(),
-                       patch: int = 10) -> Dict[str, torch.Tensor]:
-        """
-        use_heuristic_masking=True: Position/Selection 단계에서도 휴리스틱 마스킹 적용
-        """
-        B, N, _ = boxes.shape
+                       used_mask: torch.Tensor       # (B,N) bool
+                       ) -> Dict[str, torch.Tensor]:
+        # Encoders
+        box_enc, cont_enc = self.backbone(boxes, cont_flat)  # (B,N,d), (B,100,d)
 
-        box_enc, cont_enc = self.backbone(boxes, cont_flat)
-        
-        # Position
-        logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
-        # 최소 박스 크기 기반 경계 마스킹
-        valid_pos_mask = self._compute_valid_position_mask(
-            boxes, used_mask, env_config.L, env_config.W, patch
-        )
-        
-        logits_pos = logits_pos.masked_fill(~valid_pos_mask, float('-inf'))
+        # 1) Position
+        logits_pos, ctx = self.pos_dec(cont_enc, box_enc)  # (B,100), (B,100,d)
 
+        # 2) Sample position index
         dist_p = Categorical(logits=logits_pos)
-        pos_idx = dist_p.sample()
-
-        pos_logp = dist_p.log_prob(pos_idx)
+        pos_idx = dist_p.sample()                   # (B,)
+        pos_logp = F.log_softmax(logits_pos, dim=-1).gather(1, pos_idx.view(-1,1)).squeeze(1)
         pos_entropy = dist_p.entropy()
 
-        xy = self._pos_index_to_xy(pos_idx, patch)
-        
-        # Selection
-        pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)
-        logits_sel, _ = self.sel_dec(box_enc, pos_emb)
+        # 3) Position embedding
+        pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)   # (B,1,d)
 
-        # 선택한 위치에 들어갈 박스만 마스킹
-        valid_sel_mask = self._compute_valid_selection_mask(
-            boxes, used_mask, xy, env_config.L, env_config.W
-        )
-        logits_sel = logits_sel.masked_fill(~valid_sel_mask, float('-inf'))
-
-        # ===== 핵심 수정: All -inf 체크 BEFORE sampling =====
-        all_invalid_sel = torch.all(torch.isinf(logits_sel) & (logits_sel < 0), dim=-1)
-        
-        if all_invalid_sel.any():
-            print(f"[DEBUG] All -inf in selection for batch: {torch.where(all_invalid_sel)[0].tolist()}")
-            for b in range(B):
-                if all_invalid_sel[b]:
-                    # 디버깅 정보 출력
-                    print(f"  Batch {b}: xy={xy[b].tolist()}, "
-                        f"used={used_mask[b].tolist()}, "
-                        f"boxes={boxes[b].tolist()}, "
-                        f"remaining_boxes={(~used_mask[b]).sum().item()}")
-                            
+        # 4) Selection (mask out used boxes)
+        logits_sel, _ = self.sel_dec(box_enc, pos_emb)   # (B,N)
+        logits_sel = logits_sel.masked_fill(used_mask, float('-inf'))
         dist_s = Categorical(logits=logits_sel)
-        sel_idx = dist_s.sample()
-        sel_logp = dist_s.log_prob(sel_idx)
+        sel_idx = dist_s.sample()                 # (B,)
+        sel_logp = F.log_softmax(logits_sel, dim=-1).gather(1, sel_idx.view(-1,1)).squeeze(1)
         sel_entropy = dist_s.entropy()
-        
-        # Orientation (중복 제거 + 경계 체크)
+
+        # 5) Orientation for the selected box (with VALID-CLASS MASKING)
         B, N, _ = boxes.shape
-        gather_idx = sel_idx.view(B, 1, 1).expand(-1, 1, 3)
-        picked_lwh = boxes.gather(1, gather_idx).squeeze(1)
-        
-        orient_emb = self.orient_embed(picked_lwh)
-        logits_or, _ = self.orient_dec(orient_emb, pos_emb)
-        
-        valid_or_mask = self._compute_valid_orientation_mask(
-            picked_lwh, xy, env_config.L, env_config.W
-        )
-        logits_or = logits_or.masked_fill(~valid_or_mask, float('-inf'))
-        
+        gather_idx = sel_idx.view(B,1,1).expand(-1,1,3)  # (B,1,3)
+        picked_lwh = boxes.gather(1, gather_idx).squeeze(1)  # (B,3)
+        orient_emb = self.orient_embed(picked_lwh)  # (B,6,d)
+        logits_or, _ = self.orient_dec(orient_emb, pos_emb)  # (B,6)
+
+        # ---- 유효 오리엔테이션 개수(1/3/6)로 마스킹 ----
+        n_valid = self._num_valid_orients(picked_lwh)          # (B,)
+        ar6 = torch.arange(6, device=logits_or.device).view(1, 6).expand(B, -1)
+        valid_mask = ar6 < n_valid.unsqueeze(1)                 # True=valid
+        logits_or = logits_or.masked_fill(~valid_mask, float('-inf'))
+
         dist_o = Categorical(logits=logits_or)
-        orient_idx = dist_o.sample()
-        orient_logp = dist_o.log_prob(orient_idx)
+        orient_idx = dist_o.sample()                            # (B,)
+        orient_logp = F.log_softmax(logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
         orient_entropy = dist_o.entropy()
-        
-        # 최종 출력
+        # -----------------------------------------------
+
+        # 6) Compose
         total_logp = pos_logp + sel_logp + orient_logp
         total_entropy = pos_entropy + sel_entropy + orient_entropy
-        
+
+        xy = self._pos_index_to_xy(pos_idx)   # (B,2) int-like
+
         return {
             'pos_idx': pos_idx, 'sel_idx': sel_idx, 'orient_idx': orient_idx,
             'xy': xy,
             'logp_pos': pos_logp, 'logp_sel': sel_logp, 'logp_or': orient_logp,
             'logp': total_logp, 'entropy': total_entropy,
-            'logits_pos': logits_pos,
-            'logits_sel': logits_sel,
-            'logits_or': logits_or,
+            # ↓ 그리디 평가용으로 전체 분포(logits)도 넘겨주자
+            'logits_pos': logits_pos,     # (B,100)
+            'logits_sel': logits_sel,     # (B,N)
+            'logits_or':  logits_or,      # (B,6) (마스킹 적용된 분포)
         }
-
 
     def evaluate_actions(self,
                          boxes: torch.Tensor,
@@ -447,62 +274,37 @@ class PolicyNet(nn.Module):
                          used_mask: torch.Tensor,
                          pos_idx: torch.Tensor,
                          sel_idx: torch.Tensor,
-                         orient_idx: torch.Tensor,
-                         env_config: EnvConfig = EnvConfig(),
-                         patch: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
-        
-        B, N, _ = boxes.shape
-        
+                         orient_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         box_enc, cont_enc = self.backbone(boxes, cont_flat)
-
-        # ===== 1) POSITION (휴리스틱 마스킹 동일 적용) =====
         logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
-
-        valid_pos_mask = self._compute_valid_position_mask(
-            boxes, used_mask, env_config.L, env_config.W, patch
-        )  # (B,100) True=유효
-        logits_pos = logits_pos.masked_fill(~valid_pos_mask, float('-inf'))
-        
-
+        pos_logp = F.log_softmax(logits_pos, dim=-1).gather(1, pos_idx.view(-1,1)).squeeze(1)
         dist_p = Categorical(logits=logits_pos)
-        pos_logp = dist_p.log_prob(pos_idx)
         pos_ent = dist_p.entropy()
-
-        # pos_idx -> xy (B,2)
-        xy = self._pos_index_to_xy(pos_idx, patch)
 
         pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)
 
-        # ===== 2) SELECTION (위치 적합성 마스킹 적용) =====
         logits_sel, _ = self.sel_dec(box_enc, pos_emb)
-
-        valid_sel_mask = self._compute_valid_selection_mask(
-            boxes, used_mask, xy, env_config.L, env_config.W
-        )  # (B,N) True=선택 가능
-        logits_sel = logits_sel.masked_fill(~valid_sel_mask, float('-inf'))
-
+        logits_sel = logits_sel.masked_fill(used_mask, float('-inf'))
+        sel_logp = F.log_softmax(logits_sel, dim=-1).gather(1, sel_idx.view(-1,1)).squeeze(1)
         dist_s = Categorical(logits=logits_sel)
-        sel_logp = dist_s.log_prob(sel_idx)
         sel_ent = dist_s.entropy()
 
-        # 선택 박스 차원 추출
+        # 선택된 박스에서 유효 오리엔테이션 개수 산출 → 동일 마스킹
+        B, N, _ = boxes.shape
         gather_idx = sel_idx.view(B,1,1).expand(-1,1,3)
         picked_lwh = boxes.gather(1, gather_idx).squeeze(1)     # (B,3)
-
-        # ===== 3) ORIENTATION (경계 기반 마스킹 적용) =====
         orient_emb = self.orient_embed(picked_lwh)
         logits_or, _ = self.orient_dec(orient_emb, pos_emb)
 
-        valid_or_mask = self._compute_valid_orientation_mask(
-            picked_lwh, xy, env_config.L, env_config.W
-        )  # (B,6)
-        logits_or = logits_or.masked_fill(~valid_or_mask, float('-inf'))
+        n_valid = self._num_valid_orients(picked_lwh)          # (B,)
+        ar6 = torch.arange(6, device=logits_or.device).view(1, 6).expand(B, -1)
+        valid_mask = ar6 < n_valid.unsqueeze(1)
+        logits_or = logits_or.masked_fill(~valid_mask, float('-inf'))
 
+        orient_logp = F.log_softmax(logits_or, dim=-1).gather(1, orient_idx.view(-1,1)).squeeze(1)
         dist_o = Categorical(logits=logits_or)
-        orient_logp = dist_o.log_prob(orient_idx)
         orient_ent = dist_o.entropy()
 
-        # ===== 최종 =====
         total_logp = pos_logp + sel_logp + orient_logp
         total_entropy = pos_ent + sel_ent + orient_ent
         return total_logp, total_entropy
@@ -544,10 +346,7 @@ def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"{run_name}.csv")
 
-    header = ["run","ts","update","T",
-              "return_sum","mean_UR_last","mean_UR_best",
-              "actor_loss","critic_loss","entropy",
-              "mean_step","mean_invalid"]
+    header = ["run","ts","update","T","return_sum","mean_UR","actor_loss","critic_loss","entropy"]
     offset = 0
     file_exists = os.path.exists(log_path) and os.path.getsize(log_path) > 0
 
@@ -600,13 +399,13 @@ def make_obs_tensor(env, device):
     used_mask= torch.from_numpy(used_np).to(device)               # (1,N) bool
     return raw_flat, cont_flat, boxes, used_mask
 
-    # BUGFIX: max_eval_steps 지역변수 참조 오류 → 인자화
-def render_eval(policy, env_cfg, device, out_base, max_eval_steps: int | None = None):
+
+def render_eval(policy, env_cfg, device, out_base):
     env = PackingEnv(env_cfg); env.reset()
     policy.eval()
     if max_eval_steps is None:
         # 환경 max_steps가 있으면 그 2~3배 정도로 (정지 보장)
-        max_eval_steps = int(getattr(env_cfg, "max_steps", 200) or 200) * 3
+        max_eval_steps = int(getattr(env_cfg, "max_steps", 200)) * 3
 
     with torch.inference_mode():
         done = False
@@ -659,12 +458,6 @@ def render_eval(policy, env_cfg, device, out_base, max_eval_steps: int | None = 
 def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
     dprint(f"[init] num_updates={cfg.num_updates}, epochs_per_update={cfg.epochs_per_update}, batch_size={cfg.batch_size}")
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
-
-    curriculum = CurriculumScheduler()
-    dprint("[curriculum] Initialized with stages:")
-    for i, stage in enumerate(curriculum.stages):
-        dprint(f"  Stage {i+1}: {stage.name} | N={stage.box_count_range} | "
-               f"Duration={stage.duration_updates}")
     
     # --- RNG 초기화 (처음 한 번만) ---
     np.random.seed(cfg.seed)
@@ -713,26 +506,6 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
         for update in range(start_update, cfg.num_updates + 1):
             dprint(f"[loop] update {update}/{cfg.num_updates} start")
 
-            # === 여기에 추가 (기존 done_reason_counts 선언 전) ===
-            stage_info = curriculum.get_stage_info(update)
-            current_stage = curriculum.get_stage(update)
-
-            # === 모든 환경에 같은 박스 개수 적용 (수정) ===
-            N_sampled = curriculum.sample_box_count(update)  # 한 번만 샘플링
-    
-            # 단계 전환 로그
-            if update == start_update or (update > start_update and 
-                curriculum.get_stage(update - 1) != current_stage):
-                dprint(f"\n{'='*60}")
-                dprint(f"[CURRICULUM] Advancing to {stage_info['stage_name']}")
-                dprint(f"  Box Count: {current_stage.box_count_range}")
-                dprint(f"  Size Range: {current_stage.size_range}")
-                dprint(f"{'='*60}\n")
-
-            done_reason_counts = Counter()
-            step_reason_counts = Counter()   # ← 모든 스텝의 reason 집계(종료/비종료 포함)            
-            done_reason_samples = []  # (t, env_id, reason, detail)
-
             # Rollout buffers (episode length ≤ N)
             trajs = [
             {k: [] for k in [
@@ -745,21 +518,12 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # 초기화
             for env in envs:
-                env.cfg.N = N_sampled
-                env.cfg.l_range = current_stage.size_range
-                env.cfg.w_range = current_stage.size_range
-                env.cfg.h_range = current_stage.size_range
-                env.reset()  # 새 설정으로 리셋
-            # ===================
+                env.reset()
+            policy.eval(); value.eval()
 
             last_done = [False] * num_envs
 
             # 고정 길이 롤아웃: 정확히 n_steps 스텝 수집
-            # --- 최고 UR 스냅샷 추적기 초기화 ---
-            best_ur_per_env = [-1.0 for _ in range(num_envs)]
-            # (boxes_snapshot(list of tuples), H_tilde(int))
-            best_snap_per_env: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
-
             for t in range(n_steps):
                 active_envs = list(range(num_envs))  # done 여부 상관없이 모두 참여
 
@@ -782,7 +546,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
                 # --- Policy batch forward ---
                 with torch.inference_mode():
-                    out = policy.forward_decode(boxes, cont_flat, raw_flat, used_mask, env_cfg)
+                    out = policy.forward_decode(boxes, cont_flat, raw_flat, used_mask)
                     pos_idx = out['pos_idx']      # (B,)
                     sel_idx = out['sel_idx']      # (B,)
                     orient_idx = out['orient_idx']# (B,)
@@ -798,21 +562,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     obs, reward, done, info = env.step((x, y,
                                                          int(sel_idx[j].item()),
                                                          int(orient_idx[j].item())))
-                    # --- 모든 스텝 reason 집계 ---
-                    step_key = (info or {}).get("reason", "unknown")
-                    step_reason_counts[step_key] += 1
-
-                    # --- UR(best) 추적 ---
-                    try:
-                        current_ur = env.utilization_rate()
-                        if current_ur > best_ur_per_env[i]:
-                            best_ur_per_env[i] = current_ur
-                            # placed_boxes는 리스트이므로 스냅샷 복사
-                            boxes_copy = list(env.placed_boxes)
-                            best_snap_per_env[i] = (boxes_copy, env.current_max_height())
-                    except Exception:
-                        pass
-
+                    reward_scale = 1e-3
                     # Store (현재 스텝의 transition)
                     trajs[i]['boxes'     ].append(boxes[j:j+1].detach().cpu())
                     trajs[i]['cont_flat' ].append(cont_flat[j:j+1].detach().cpu())
@@ -822,7 +572,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     trajs[i]['sel_idx'   ].append(sel_idx[j:j+1].detach().cpu())
                     trajs[i]['orient_idx'].append(orient_idx[j:j+1].detach().cpu())
                     trajs[i]['logp_old'  ].append(logp[j:j+1].detach().cpu())
-                    trajs[i]['rewards'   ].append(torch.tensor([reward], dtype=torch.float32))
+                    trajs[i]['rewards'   ].append(torch.tensor([reward * reward_scale], dtype=torch.float32))
                     trajs[i]['dones'     ].append(torch.tensor([done], dtype=torch.float32))
                     trajs[i]['values'    ].append(V[j:j+1].detach().cpu())
 
@@ -831,12 +581,6 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
                     # done이면 즉시 reset → 다음 스텝 참여
                     if done:
-                        # --- 종료 이유 수집(끝난 스텝만) ---
-                        reason = (info or {}).get("reason", "unknown")
-                        detail = (info or {}).get("detail", None)
-                        done_reason_counts[reason] += 1
-                        if len(done_reason_samples) < cfg.print_first_k_done:
-                            done_reason_samples.append((t, i, reason, detail))
                         env.reset()
             
             with ThreadPoolExecutor(max_workers=min(8, num_envs)) as pool:
@@ -857,56 +601,17 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # --- 시각화 저장 ---
             if update % cfg.log_interval == 0:
-                # 4-1) 마지막 상태(기존) - env0
-                boxes_last = envs[0].placed_boxes
-                out_base_last = f"results/plots/packing_u{update:05d}"
-                save_packing_3d(boxes_last,
-                                container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
-                                out_path=out_base_last+".png")
-                save_packing_3d_interactive(boxes_last,
-                                container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
-                                out_path=out_base_last+".html")
-                # 4-2) 최고 UR 스냅샷(신규) - env0
-                if best_snap_per_env[0] is not None:
-                    best_boxes0, best_H0 = best_snap_per_env[0]
-                    out_base_best = f"results/plots/packing_best_u{update:05d}"
-                    save_packing_3d(best_boxes0,
-                                    container=(env_cfg.L, env_cfg.W, best_H0),
-                                    out_path=out_base_best+".png")
-                    save_packing_3d_interactive(best_boxes0,
-                                    container=(env_cfg.L, env_cfg.W, best_H0),
-                                    out_path=out_base_best+".html")
-
-            # --- 모든 스텝 reason 요약 ---
-            if step_reason_counts:
-                total_steps = sum(step_reason_counts.values())
-                dprint("[step-reasons] total:", total_steps,
-                       "| " + " | ".join(f"{k}:{v}" for k,v in step_reason_counts.most_common()))
-            else:
-                dprint("[step-reasons] (none)")
-
-            # --- 종료(reason) 요약 ---
-            if update % cfg.log_done_reasons_every == 0:
-                if done_reason_counts:
-                    total_done = sum(done_reason_counts.values())
-                    dprint("[done-reasons] total:", total_done,
-                           "| " + " | ".join(f"{k}:{v}" for k,v in done_reason_counts.most_common()))
-                    if done_reason_samples:
-                        dprint("[done-reasons] samples (t, env, key, detail) ↓")
-                        for s in done_reason_samples:
-                            dprint("   ", s)
-                else:
-                    dprint("[done-reasons] no termination observed in rollout window")
+                boxes = envs[0].placed_boxes
+                out_base = f"results/plots/packing_u{update:05d}"
+                save_packing_3d(boxes, container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
+                                out_path=out_base+".png")
+                save_packing_3d_interactive(boxes, container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
+                                            out_path=out_base+".html")
 
             # --- 에피소드 통계 ---
             return_sum = float(np.mean([sum(r.item() for r in traj['rewards']) for traj in trajs]))
-            ur_last = float(np.mean([env.utilization_rate() for env in envs]))
-            ur_best = float(np.mean([u for u in best_ur_per_env if u >= 0.0])) if any(u >= 0.0 for u in best_ur_per_env) else 0.0
-            mean_step = float(np.mean([getattr(env, "step_count", 0) for env in envs]))
-            mean_invalid = float(np.mean([getattr(env, "invalid_count", 0) for env in envs]))
-            dprint(f"[collect] trajectories ready | T={n_steps * num_envs} | "
-                   f"return={return_sum:.2f} | UR(last)={ur_last:.4f} | UR(best)={ur_best:.4f} | "
-                   f"step(avg)={mean_step:.1f} | invalid(avg)={mean_invalid:.1f}")
+            ur = float(np.mean([env.utilization_rate() for env in envs]))
+            dprint(f"[collect] trajectories ready | T={n_steps * num_envs} | return={return_sum:.2f} | UR={ur:.4f}")
 
             # --- rollout 병합 ---
             traj = {k: torch.cat([torch.cat(trajs[i][k], dim=0) for i in range(num_envs)], dim=0)
@@ -1047,9 +752,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # --- 로그 ---
             if update % cfg.log_interval == 0:
-                dprint(f"[update {update}] T={T} | "
-                    f"Stage={stage_info['stage_name']} ({stage_info['progress']:.0%}) | "
-                    f"Return={returns_T.sum().item():.1f} | ActorLoss={actor_loss.item():.4f} | CriticLoss={critic_loss.item():.4f} | "
+                dprint(f"[update {update}] T={T} | Return={returns_T.sum().item():.1f} | "
+                    f"ActorLoss={actor_loss.item():.4f} | CriticLoss={critic_loss.item():.4f} | "
                     f"Entropy={entropy_mean.item():.4f}")
                 
                 # 그리디 평가 (완주) 스냅샷
@@ -1062,10 +766,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             try:
                 csv_w.writerow([
                     run_name, session_tag, update, T,
-                    f"{return_sum:.4f}",
-                    f"{ur_last:.6f}", f"{ur_best:.6f}",
-                    f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_mean.item():.6f}",
-                    f"{mean_step:.2f}", f"{mean_invalid:.2f}"
+                    f"{return_sum:.4f}", f"{ur:.6f}",
+                    f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_mean.item():.6f}"
                 ])
                 csv_f.flush()
             except Exception as e:
@@ -1112,10 +814,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                             x = int(row.get("update"))
                             updates.append(x)
                             rets.append(float(row["return_sum"]))
-                            # 컬럼명 변경 호환: mean_UR_last / mean_UR
-                            urs_last = float(row.get("mean_UR_last", row.get("mean_UR", 0.0)))
-                            urs_best = float(row.get("mean_UR_best", 0.0))
-                            urs.append((urs_last, urs_best))
+                            urs.append(float(row["mean_UR"]))
                         except Exception:
                             pass
 
@@ -1131,15 +830,10 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                 plt.savefig(ret_png, dpi=150)
                 plt.close()
 
-                # UR(last) / UR(best) 분리 플롯
-                ur_last_series = [u[0] for u in urs]
-                ur_best_series = [u[1] for u in urs]
                 plt.figure()
-                plt.plot(updates, ur_last_series, label="UR(last)")
-                plt.plot(updates, ur_best_series, label="UR(best)")
+                plt.plot(updates, urs)
                 plt.title(f"Utilization Rate — {run_name}")
                 plt.xlabel("update"); plt.ylabel("UR")
-                plt.legend()
                 plt.tight_layout()
                 ur_png = os.path.join(out_dir, f"{run_name}_ur.png")
                 plt.savefig(ur_png, dpi=150)
@@ -1168,11 +862,10 @@ if __name__ == "__main__":
         W = int(env_y["container"]["width"])
         seed = int(env_y["container"]["seed"])
         N = int(env_y["boxes"]["count"])
-        invalid_penalty = float(env_y["reward"]["invalid_penalty"])
         num_envs = int(env_y["env"]["num_envs"])
         max_steps = int(env_y["env"]["max_steps"])
         ecfg = EnvConfig(L=L, W=W, N=N, seed=seed, num_envs=num_envs, max_steps=max_steps)
-        dprint(f"[cfg] env.yaml loaded → L={L}, W={W}, N={N}, seed={seed}, num_envs={num_envs}, max_steps={max_steps}, invalid_penalty={invalid_penalty}")
+        dprint(f"[cfg] env.yaml loaded → L={L}, W={W}, N={N}, seed={seed}, num_envs={num_envs}, max_steps={max_steps}")
     except Exception as e:
         dprint("[cfg] env.yaml not loaded, using defaults:", e)
 

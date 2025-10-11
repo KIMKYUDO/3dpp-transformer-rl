@@ -28,7 +28,7 @@ class EnvConfig:
     max_steps: Optional[int] = 200
     num_envs: int = 4
     # 무효 시도 허용 상한(연속/누적 관리용)
-    max_invalid_attempts: int = 20
+    max_invalid_attempts: int = 500
 
 
 class PackingEnv:
@@ -51,9 +51,7 @@ class PackingEnv:
         self.used = np.zeros(0, dtype=bool)
         self.t = 0
         self._sum_vol = 0  # \sum lwh for placed boxes
-        self._g_prev: float = 0.0
-        self._ur_prev: float = 0.0
-        self._H_prev: int = 0
+        self._g_prev = 0   # g_{i-1}
         self.placed_boxes = []   # (x,y,z,l,w,h) 튜플 기록
         self.invalid_penalty = cfg.invalid_penalty
 
@@ -70,22 +68,13 @@ class PackingEnv:
     
     @staticmethod
     def _orientations(l: int, w: int, h: int) -> List[Box]:
-        """6개 회전 반환 (중복 포함, Policy와 인덱스 일치 보장)
-        
-        Policy의 OrientationEmbedder와 동일한 순서:
-        0: (l,w,h), 1: (l,h,w), 2: (w,l,h),
-        3: (w,h,l), 4: (h,l,w), 5: (h,w,l)
-        
-        중복 제거 안 함! (20,10,10)이면 [0,1,4]가 같아도 6개 모두 반환
-        """
-        return [
-            (l, w, h),  # 0
-            (l, h, w),  # 1
-            (w, l, h),  # 2
-            (w, h, l),  # 3
-            (h, l, w),  # 4
-            (h, w, l),  # 5
-        ]
+        # 6개의 축정렬 회전(중복 제거, **순서 보존**)
+        perms = [(l, w, h), (l, h, w), (w, l, h), (w, h, l), (h, l, w), (h, w, l)]
+        uniq: List[Box] = []
+        for p in perms:
+            if p not in uniq:
+                uniq.append(p)
+        return uniq
 
     def _max_height_in_region(self, x0: int, y0: int, l: int, w: int) -> int:
         region = self.height[y0:y0+w, x0:x0+l]
@@ -94,6 +83,7 @@ class PackingEnv:
         return int(region.max(initial=0))
 
     def _raise_region(self, x0: int, y0: int, l: int, w: int, top: int, h: int) -> None:
+        # region을 top+h까지 채움 (바닥은 top)
         self.height[y0:y0+w, x0:x0+l] = top + h
 
     def _H_tilde(self) -> int:
@@ -101,22 +91,7 @@ class PackingEnv:
 
     def _gap(self) -> int:
         # g_i = L*W*H_tilde_i - sum_volumes
-        return int(self.height.sum() - self._sum_vol)
-    
-    def utilization_rate(self) -> float:
-        Ht = self._H_tilde()
-        denom = float(self.L * self.W * max(Ht, 1))
-        if denom == 0:
-            return 0.0
-        return float(self._sum_vol) / denom
-    
-    def current_max_height(self):
-        return int(self.height.max())
-
-    def container_state7(self) -> Optional[np.ndarray]:
-        if compute_plane_features is None:
-            raise RuntimeError("compute_plane_features is unavailable; install/enable utils.preprocess.")
-        return compute_plane_features(self.height.astype(np.float32))
+        return int(self.L * self.W * self._H_tilde() - self._sum_vol)
 
     # ---------- API ----------
     def reset(self, boxes: Optional[List[Box]] = None) -> Dict:
@@ -133,11 +108,6 @@ class PackingEnv:
         else:
             self.boxes = [tuple(map(int, b)) for b in boxes]
         self.used = np.zeros(len(self.boxes), dtype=bool)
-        
-        self._g_prev = self._gap()
-        self._ur_prev = self.utilization_rate()
-        self._H_prev = self._H_tilde()
-
         obs = {
             "height": self.height.copy(),
             "remaining": (~self.used).sum(),
@@ -164,148 +134,94 @@ class PackingEnv:
         x, y, bidx, oidx = map(int, action)
         info: Dict[str, object] = {}
 
-        # ===== Invalid Action 처리 =====
+        # 1) 박스 선택 유효성
         if not (0 <= bidx < len(self.boxes)) or self.used[bidx]:
             self.invalid_count += 1
             obs = {"height": self.height.copy(), "remaining": (~self.used).sum(), "gap": self._gap()}
             info["reason"] = "invalid_selection"
             info["detail"] = f"bidx={bidx}, used={bool(self.used[bidx]) if 0 <= bidx < len(self.used) else 'n/a'}"
-
-            done = (self.invalid_count >= self.cfg.max_invalid_attempts)
-            info["terminated_by"] = "too_many_invalid" if done else None
+            done = False
+            if self.invalid_count >= self.cfg.max_invalid_attempts:
+                done = True
+                info["terminated_by"] = "too_many_invalid"
+            else:
+                info["terminated_by"] = None
             info["invalid_count"] = self.invalid_count
-
             return obs, float(self.cfg.invalid_penalty), done, info
 
-        # ✅ 회전(orientation) 적용
-        orientations = self._orientations(*self.boxes[bidx])
-        
-        # oidx 범위 체크 (항상 6개이므로 0~5)
-        if not (0 <= oidx < 6):
+        # 2) 오리엔테이션 유효성
+        l, w, h = self.boxes[bidx]
+        orients = self._orientations(l, w, h)
+        if not (0 <= oidx < len(orients)):
             self.invalid_count += 1
-            obs = {"height": self.height.copy(), 
-                   "remaining": (~self.used).sum(), 
-                   "gap": self._gap()}
+            obs = {"height": self.height.copy(), "remaining": (~self.used).sum(), "gap": self._gap()}
             info["reason"] = "invalid_orientation"
-            info["detail"] = f"oidx={oidx}, expected 0~5"
-            
-            done = (self.invalid_count >= self.cfg.max_invalid_attempts)
-            info["terminated_by"] = "too_many_invalid" if done else None
+            info["detail"] = f"bidx={bidx}, oidx={oidx}, valid={len(orients)}"
+            done = False
+            if self.invalid_count >= self.cfg.max_invalid_attempts:
+                done = True
+                info["terminated_by"] = "too_many_invalid"
+            else:
+                info["terminated_by"] = None
             info["invalid_count"] = self.invalid_count
-            
             return obs, float(self.cfg.invalid_penalty), done, info
-        
-        l, w, h = orientations[oidx]
 
-        if not self._within_bounds(x, y, l, w):
+        l2, w2, h2 = orients[oidx]
+
+        # 3) 경계 체크 (벗어나면 즉시 종료)
+        if not self._within_bounds(x, y, l2, w2):
             self.invalid_count += 1
-            obs = {"height": self.height.copy(), 
-                   "remaining": (~self.used).sum(), 
-                   "gap": self._gap()}
+            obs = {"height": self.height.copy(), "remaining": (~self.used).sum(), "gap": self._gap()}
             info["reason"] = "out_of_bounds"
-            info["detail"] = f"xy=({x},{y}), size=({l},{w})"
-            
-            done = (self.invalid_count >= self.cfg.max_invalid_attempts)
-            info["terminated_by"] = "too_many_invalid" if done else None
+            info["detail"] = f"xy=({x},{y}), size=({l2},{w2})"
+            # 즉시 종료 대신 패널티만 주고 재시도 허용, 단 한도 초과 시 종료
+            done = False
+            if self.invalid_count >= self.cfg.max_invalid_attempts:
+                done = True
+                info["terminated_by"] = "too_many_invalid"
+            else:
+                info["terminated_by"] = None
             info["invalid_count"] = self.invalid_count
-            
             return obs, float(self.cfg.invalid_penalty), done, info
 
         # 진행: 유효 배치만 성공 카운트 증가
         self.step_count += 1
 
-        # ✅ 배치 전 상태 저장 (height 효율 계산용)
-        g_prev = self._g_prev
-        ur_prev = self._ur_prev
-        H_prev = self._H_prev
+        # 4) 배치: 해당 영역의 현재 최대 높이(top) 위에 올림
+        top = self._max_height_in_region(x, y, l2, w2)
+        self._raise_region(x, y, l2, w2, top, h2)
+        self.placed_boxes.append((x, y, top, l2, w2, h2))
 
-        # 배치 실행
-        top = self._max_height_in_region(x, y, l, w)
-        self._raise_region(x, y, l, w, top, h)
-        self.placed_boxes.append((x, y, top, l, w, h))
+        # 5) 상태 갱신
         self.used[bidx] = True
-        self._sum_vol += int(l * w * h)
+        self.t += 1
+        self._sum_vol += int(l2 * w2 * h2)
 
-        # 현재 상태 계산
         g_now = self._gap()
-        ur_now = self.utilization_rate()
-        H_now = self._H_tilde()
-
-        # ===== Reward Shaping =====
-        # 1) Gap 감소 (잠재함수 기반, 최적해 보존)
-        gap_reward = float(g_prev - g_now)
-
-        # 2) UR 증분 (중복 제거)
-        K_ur = 20.0
-        ur_reward = (ur_now - ur_prev) * K_ur
-
-        # 3) Height 효율 (간소화 버전) ✅
-        if H_now > H_prev:
-            h_increase = H_now - H_prev
-            
-            # 박스 바닥~상단 중 H_prev 위 부분만 카운트
-            box_top = top + h
-            
-            if box_top <= H_prev:
-                vol_above = 0.0  # 전부 묻힘
-            elif top >= H_prev:
-                vol_above = float(l * w * h)  # 전부 새 슬랩
-            else:
-                # 일부만 H_prev 위로
-                vol_above = float(l * w * (box_top - H_prev))
-            
-            # 새 슬랩 용량 대비 효율
-            slab_capacity = h_increase * self.L * self.W
-            efficiency = vol_above / (slab_capacity + 1e-6)
-            
-            K_h = 5.0
-            height_reward = float(np.clip(K_h * efficiency, 0.0, K_h))
-        else:
-            height_reward = 0.0
-
-        # 4) 완료 보너스
-        if self.used.all():
-            completion_bonus = 50.0 + 50.0 * ur_now
-        else:
-            completion_bonus = 0.0
-
-         # 총 보상
-        reward = gap_reward + ur_reward + height_reward + completion_bonus
-
-        # ✅ 상태 업데이트 (필수!)
+        reward = float(self._g_prev - g_now)  # r_i = g_{i-1} - g_i
         self._g_prev = g_now
-        self._ur_prev = ur_now
-        self._H_prev = H_now
 
-        # 4) 종료 판정 + reason
+        # 6) 종료 판정 + reason
         done = False
         reason = "placed"  # 정상 배치가 이루어졌고 아직 종료가 아닌 경우의 기본 라벨
-
         if self.used.all():
             done = True
-            reason = "complete"
-        elif (self.max_steps is not None) and (self.step_count >= self.max_steps):
+            reason = "no_space"  # 더 놓을 박스 없음(= 전부 배치 완료)
+
+        # 성공 배치 한도
+        if (self.max_steps is not None) and (self.step_count >= self.max_steps):
             done = True
             reason = "max_steps"
 
-        # ===== Info 구성 =====
         info.update({
             "reason": reason,
-            "H_tilde": H_now,
+            "H_tilde": self._H_tilde(),
             "gap": g_now,
             "sum_vol": self._sum_vol,
-            "placed_box": (l, w, h),
+            "placed_box": (l2, w2, h2),
             "step_count": self.step_count,
             "invalid_count": self.invalid_count,
             "terminated_by": reason if done else None,
-            "ur": ur_now,
-            "reward_breakdown": {
-                "gap": float(gap_reward),
-                "ur": float(ur_reward),
-                "height": float(height_reward),
-                "completion": float(completion_bonus),
-                "total": float(reward)
-            }
         })
 
         obs = {
@@ -314,3 +230,19 @@ class PackingEnv:
             "gap": g_now,
         }
         return obs, reward, done, info
+    
+    def current_max_height(self):
+        return int(self.height.max())
+
+    # 선택: 정책 입력용 컨테이너 상태 7채널
+    def container_state7(self) -> Optional[np.ndarray]:
+        if compute_plane_features is None:
+            raise RuntimeError("compute_plane_features is unavailable; install/enable utils.preprocess.")
+        return compute_plane_features(self.height.astype(np.float32))
+
+    def utilization_rate(self) -> float:
+        Ht = self._H_tilde()
+        denom = float(self.L * self.W * max(Ht, 1))
+        if denom == 0:
+            return 0.0
+        return float(self._sum_vol) / denom

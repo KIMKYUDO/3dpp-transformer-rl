@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ------------------------------------------------------------
 # Positional Encoding (fixed 2D sin-cos for 10x10 grid → 100 tokens)
@@ -100,7 +101,7 @@ class BoxEncoder(nn.Module):
         x = boxes.unsqueeze(-1)            # (B, N, 3, 1)
         x = self.scalar_mlp(x)             # (B, N, 3, d)
         x = x.mean(dim=2)                  # (B, N, d)  (average over {l,w,h})
-        x = self.enc(x)                    # (B, N, d)
+        x = checkpoint(self.enc, x, use_reentrant=False)        # GPU memory efficient
         return x
 
 
@@ -127,7 +128,7 @@ class ContainerEncoder(nn.Module):
         assert cont_feat.dim() == 3 and cont_feat.size(1) == 100 and cont_feat.size(-1) == 7
         x = self.proj(cont_feat)           # (B, 100, d)
         x = x + self.pos                   # add fixed positional encoding
-        x = self.enc(x)                    # (B, 100, d)
+        x = checkpoint(self.enc, x, use_reentrant=False)        # GPU memory efficient
         return x
 
 
