@@ -1,22 +1,36 @@
-from __future__ import annotations
-from concurrent.futures import ThreadPoolExecutor
+import warnings
+warnings.filterwarnings("ignore", message="Please use the new API settings to control TF32 behavior")
+# ---- 환경변수/레거시 정리 ----
+import os, sys
+cores = os.cpu_count() or 8
+
+# 과거/중복 변수 제거
+os.environ.pop("CUDA_ALLOC_CONF", None)  # ← 이게 남아있으면 torch가 그 값을 출력합니다.
+os.environ.pop("PYTORCH_ALLOC_CONF", None)
+
+# 정식 변수만 사용
+os.environ["PYTORCH_ALLOC_CONF"] = (
+    "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+)
+
+os.environ["OMP_NUM_THREADS"] = str(max(1, cores // 3))
+os.environ["MKL_NUM_THREADS"] = str(max(1, cores // 3))
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+# ---------- (2) 라이브러리 import ----------
 import torch
 
-# 1) matmul(FP32) 내부 정밀도: 'tf32' | 'ieee'
-#    'tf32' = 텐서코어 사용(빠름), 'ieee' = 엄격 FP32(정확)
-torch.backends.cuda.matmul.fp32_precision = "tf32"
+# 스레드
+torch.set_num_threads(max(1, cores // 4))
+torch.set_num_interop_threads(2)
 
-# 2) cuDNN 전체/세부 모듈의 FP32 내부 정밀도
-torch.backends.cudnn.fp32_precision = "tf32"        # cuDNN 전반
-torch.backends.cudnn.conv.fp32_precision = "tf32"   # 합성곱 경로
-torch.backends.cudnn.rnn.fp32_precision  = "tf32"   # RNN 경로
+# 새 API로만 설정 (성능 우선: TF32)
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision  = "tf32"
 
 # --- backend 선택 & GUI import 가드 ---
 USE_GUI = False  # 훈련 중엔 False 유지
-
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
-os.environ.setdefault("MPLBACKEND", "Agg")  # 환경변수로도 고정
 
 if USE_GUI:
     # GUI 쓸 때만 TkAgg + tkinter 가져오기
@@ -71,7 +85,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Local imports
 from envs.container_sim import PackingEnv, EnvConfig
-from utils.preprocess import compute_plane_features, downsample_patches, flatten_for_encoder
+from utils.preprocess import compute_plane_features, downsample_patches, flatten_for_encoder, preprocess_batch_gpu
 from utils.logger import resolve_resume
 from utils.rng_state import get_rng_state, set_rng_state
 from utils.plotting import save_packing_3d, save_packing_3d_interactive
@@ -84,29 +98,6 @@ from agents.heads import (
 from agents.value_head import ValueNet
 
 print("CUDA_ALLOC_CONF =", os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
-
-# -----------------------------
-# 관측 전처리 병렬화 헬퍼
-# -----------------------------
-def _make_obs_from_env(env) -> _TupleForObs[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    각 env에서 관측 텐서들을 한 번에 만든다.
-    Returns: (raw_flat_np, boxes_np, used_mask_np)
-    shapes:  (1,100,7),   (1,N,3),   (1,N)
-    """
-    if hasattr(env, "container_state7"):
-        s7 = env.container_state7()
-    else:
-        hmap = getattr(env, "heightmap", getattr(env, "height", None))
-        if hmap is None:
-            raise RuntimeError("Env has no heightmap/height and no container_state7().")
-        s7 = compute_plane_features(hmap.astype(np.float32))
-
-    ds7 = downsample_patches(s7, patch=10)
-    raw_flat_np = flatten_for_encoder(ds7)[None, ...].astype(np.float32)  # (1,100,7)
-    boxes_np    = np.asarray(env.boxes, dtype=np.float32)[None, ...]      # (1,N,3)
-    used_np     = env.used.astype(np.bool_)[None, ...]                     # (1,N)
-    return raw_flat_np, boxes_np, used_np
 
 # ------------------------------------------------------------
 # 디렉터리 안전가드
@@ -506,6 +497,93 @@ class PolicyNet(nn.Module):
         total_logp = pos_logp + sel_logp + orient_logp
         total_entropy = pos_ent + sel_ent + orient_ent
         return total_logp, total_entropy
+    
+    def forward_greedy(self,
+                   boxes: torch.Tensor,          # (B,N,3)
+                   cont_flat: torch.Tensor,      # (B,100,7)
+                   raw_flat: torch.Tensor,       # (B,100,7)
+                   used_mask: torch.Tensor,      # (B,N) bool
+                   env_config = None,
+                   patch: int = 10) -> Dict[str, torch.Tensor]:
+        """
+        Greedy evaluation 전용 forward pass
+        
+        Training의 forward_decode와 차이점:
+        1. Sampling 대신 argmax 사용
+        2. 각 단계마다 masking을 **선택 후** 재계산
+        3. Log prob 계산 생략 (불필요)
+        4. 더 빠른 실행 (gradient 계산 없음)
+        
+        Returns:
+        --------
+        Dict with keys:
+            - 'pos_idx': (B,) selected position indices
+            - 'sel_idx': (B,) selected box indices  
+            - 'orient_idx': (B,) selected orientation indices
+            - 'logits_pos': (B, 100) position logits (for debugging)
+            - 'logits_sel': (B, N) selection logits (for debugging)
+            - 'logits_or': (B, 6) orientation logits (for debugging)
+        """
+        
+        B, N, _ = boxes.shape
+        device = boxes.device
+        
+        # ===== Encoding (공통) =====
+        box_enc, cont_enc = self.backbone(boxes, cont_flat)
+        
+        # ===== 1단계: POSITION (Greedy) =====
+        logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
+        
+        # Position masking (최소 박스 크기 기반)
+        valid_pos_mask = self._compute_valid_position_mask(
+            boxes, used_mask, env_config.L, env_config.W, patch
+        )
+        logits_pos = logits_pos.masked_fill(~valid_pos_mask, float('-inf'))
+        
+        # Greedy selection (argmax)
+        pos_idx = logits_pos.argmax(dim=-1)  # (B,)
+        xy = self._pos_index_to_xy(pos_idx, patch)  # (B, 2)
+        
+        # Position embedding (선택된 위치 기반)
+        pos_emb = self.pos_emb_builder(ctx, raw_flat, pos_idx)
+        
+        # ===== 2단계: SELECTION (Greedy, 선택된 위치 기반 masking) =====
+        logits_sel, _ = self.sel_dec(box_enc, pos_emb)
+        
+        # ⭐ 핵심: 선택된 xy 위치에 맞는 박스만 필터링
+        valid_sel_mask = self._compute_valid_selection_mask(
+            boxes, used_mask, xy, env_config.L, env_config.W
+        )
+        logits_sel = logits_sel.masked_fill(~valid_sel_mask, float('-inf'))
+        
+        # Greedy selection (argmax)
+        sel_idx = logits_sel.argmax(dim=-1)  # (B,)
+        
+        # 선택된 박스 차원 추출
+        gather_idx = sel_idx.view(B, 1, 1).expand(-1, 1, 3)
+        picked_lwh = boxes.gather(1, gather_idx).squeeze(1)  # (B, 3)
+        
+        # ===== 3단계: ORIENTATION (Greedy, 선택된 박스+위치 기반 masking) =====
+        orient_emb = self.orient_embed(picked_lwh)
+        logits_or, _ = self.orient_dec(orient_emb, pos_emb)
+        
+        # ⭐ 핵심: 선택된 박스와 위치에 맞는 회전만 필터링
+        valid_or_mask = self._compute_valid_orientation_mask(
+            picked_lwh, xy, env_config.L, env_config.W
+        )
+        logits_or = logits_or.masked_fill(~valid_or_mask, float('-inf'))
+        
+        # Greedy selection (argmax)
+        orient_idx = logits_or.argmax(dim=-1)  # (B,)
+        
+        return {
+            'pos_idx': pos_idx,
+            'sel_idx': sel_idx,
+            'orient_idx': orient_idx,
+            'logits_pos': logits_pos,  # 디버깅용
+            'logits_sel': logits_sel,
+            'logits_or': logits_or,
+        }
 
 
 # ------------------------------------------------------------
@@ -547,7 +625,8 @@ def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
     header = ["run","ts","update","T",
               "return_sum","mean_UR_last","mean_UR_best",
               "actor_loss","critic_loss","entropy",
-              "mean_step","mean_invalid"]
+              "mean_step","mean_invalid",
+              "return_eval","UR_eval"]
     offset = 0
     file_exists = os.path.exists(log_path) and os.path.getsize(log_path) > 0
 
@@ -579,78 +658,131 @@ def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
     return w, f, log_path, offset
 
 def make_obs_tensor(env, device):
-    # 너의 _make_obs_from_env와 같은 로직을 "단일 env" 기준으로 텐서로 만들어줌
-    if hasattr(env, "container_state7"):
-        s7 = env.container_state7()
-    else:
-        hmap = getattr(env, "heightmap", getattr(env, "height", None))
-        if hmap is None:
-            raise RuntimeError("Env has no heightmap/height and no container_state7().")
-        s7 = compute_plane_features(hmap.astype(np.float32))
+    """
+    _make_obs_from_env와 동일한 로직 (단일 환경용)
+    """
 
-    ds7 = downsample_patches(s7, patch=10)                 # (10x10,7) 계열
-    raw_flat_np = flatten_for_encoder(ds7)[None, ...]      # (1,100,7)
-
-    boxes_np = np.array(env.boxes, dtype=np.float32)[None, ...]  # (1,N,3)
-    used_np  = env.used.astype(np.bool_)[None, ...]              # (1,N)
-
-    raw_flat = torch.from_numpy(raw_flat_np).float().to(device)  # (1,100,7)
+    # Heightmap (NumPy)
+    hmap = env.height  # NumPy array
+    
+    # GPU로 전송 + 전처리
+    hmap_gpu = torch.from_numpy(hmap).float().to(device)
+    s7 = compute_plane_features(hmap_gpu)
+    ds7 = downsample_patches(s7, patch=10)
+    flat = flatten_for_encoder(ds7)
+    
+    # (1, 100, 7)로 확장
+    raw_flat = flat.unsqueeze(0)
     cont_flat = raw_flat
-    boxes    = torch.from_numpy(boxes_np).float().to(device)     # (1,N,3)
-    used_mask= torch.from_numpy(used_np).to(device)               # (1,N) bool
+    
+    # Boxes & masks
+    boxes = torch.from_numpy(np.array(env.boxes, dtype=np.float32)).unsqueeze(0).to(device)
+    used_mask = torch.from_numpy(env.used.astype(np.bool_)).unsqueeze(0).to(device)
+    
     return raw_flat, cont_flat, boxes, used_mask
 
     # BUGFIX: max_eval_steps 지역변수 참조 오류 → 인자화
-def render_eval(policy, env_cfg, device, out_base, max_eval_steps: int | None = None):
-    env = PackingEnv(env_cfg); env.reset()
+def render_eval(policy : PolicyNet, env : PackingEnv, device : torch.device,
+                out_base : str, max_eval_steps: int | None = None):
+    """
+    Greedy evaluation with proper cascading masking
+    
+    Parameters:
+    -----------
+    policy : PolicyNet
+        Must have forward_greedy() method
+    env : PackingEnv
+        Existing environment (training env를 직접 전달)
+    device : torch.device
+    out_base : str
+    max_eval_steps : int, optional
+    
+    Returns:
+    --------
+    total_reward : float
+    ur_eval : float (utilization rate)
+    """
+    
+    # 현재 박스 저장 후 reset
+    current_boxes = env.boxes
+    env.reset(boxes=current_boxes)
+    
     policy.eval()
+    
     if max_eval_steps is None:
-        # 환경 max_steps가 있으면 그 2~3배 정도로 (정지 보장)
-        max_eval_steps = int(getattr(env_cfg, "max_steps", 200) or 200) * 3
+        max_eval_steps = int(getattr(env.cfg, "max_steps", 300) or 300) * 5
 
     with torch.inference_mode():
         done = False
         steps = 0
-        last_placed = -1   # 진행 감지용
+        last_placed = -1
         stagnation = 0
-
+        total_reward = 0.0
+        
         while (not done) and (steps < max_eval_steps):
+            # Observation
             raw_flat, cont_flat, boxes, used_mask = make_obs_tensor(env, device)
-            out = policy.forward_decode(boxes, cont_flat, raw_flat, used_mask)
-
-            # 1) 모든 박스가 사용됨 → 종료
+            
+            # 모든 박스 사용됨 체크
             if used_mask[0].all():
+                dprint(f"[eval] ✓ All {len(env.boxes)} boxes placed at step {steps}")
                 break
-
-            # 2) 그리디 선택 (로짓 argmax)
-            pos = out["logits_pos"].argmax(-1)  # (1,)
-            sel = out["logits_sel"].argmax(-1)  # (1,)
-            ori = out["logits_or" ].argmax(-1)  # (1,)
-
-            # 3) (안전) 오리엔트 유효범위 보정
-            xy  = PolicyNet._pos_index_to_xy(pos).squeeze(0).tolist()
-            x_i, y_i = int(xy[0]), int(xy[1])
-            sel_i    = int(sel.item())
-            ori_i    = int(ori.item())
-
-            # 4) 스텝 진행
-            _, _, done, _ = env.step((x_i, y_i, sel_i, ori_i))
-
-            # 5) 진행 감지 (정체되면 탈출)
+            
+            # ⭐ Greedy forward pass (cascading masking 적용)
+            out = policy.forward_greedy(
+                boxes, cont_flat, raw_flat, used_mask,
+                env_config=env.cfg
+            )
+            
+            # Action 추출
+            pos_idx = out['pos_idx'].item()
+            sel_idx = out['sel_idx'].item()
+            orient_idx = out['orient_idx'].item()
+            
+            # Position index를 xy로 변환
+            x_i = (pos_idx % 10) * 10
+            y_i = (pos_idx // 10) * 10
+            
+            # Environment step
+            _, reward, done, info = env.step((x_i, y_i, sel_idx, orient_idx))
+            total_reward += reward
+            
+            # Progress tracking
             placed_now = len(env.placed_boxes)
             if placed_now == last_placed:
                 stagnation += 1
+                if stagnation % 25 == 0:
+                    dprint(f"[eval] stagnation={stagnation}/150, "
+                           f"placed={placed_now}/{len(env.boxes)}, "
+                           f"action=({x_i},{y_i},{sel_idx},{orient_idx})")
             else:
+                if stagnation > 0:
+                    dprint(f"[eval] ✓ Progress: {placed_now}/{len(env.boxes)} boxes")
                 stagnation = 0
+                
             last_placed = placed_now
-            if stagnation >= 50:   # 50스텝 연속 진행없음 → 탈출
+            
+            if stagnation >= 150:
+                dprint(f"[eval] ✗ Stagnation limit: {placed_now}/{len(env.boxes)} placed")
                 break
 
             steps += 1
 
+        # Results
         boxes = env.placed_boxes
-        save_packing_3d(boxes, container=(env_cfg.L, env_cfg.W, env.current_max_height()), out_path=out_base+".png")
-        save_packing_3d_interactive(boxes, container=(env_cfg.L, env_cfg.W, env.current_max_height()), out_path=out_base+".html")
+        ur_eval = env.utilization_rate()
+        
+        dprint(f"[eval] Completed: {len(boxes)}/{len(env.boxes)} boxes, "
+               f"UR={ur_eval:.2%}, steps={steps}, reward={total_reward:.2f}")
+        
+        save_packing_3d(boxes, 
+                       container=(env.cfg.L, env.cfg.W, env.current_max_height()), 
+                       out_path=out_base+".png")
+        save_packing_3d_interactive(boxes, 
+                                   container=(env.cfg.L, env.cfg.W, env.current_max_height()), 
+                                   out_path=out_base+".html")
+
+    return total_reward, ur_eval
 
 # ------------------------------------------------------------
 # Training loop
@@ -711,6 +843,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
     dprint("[start] training loop")
     try:
         for update in range(start_update, cfg.num_updates + 1):
+            eval_ret, eval_ur = 0.0, 0.0
             dprint(f"[loop] update {update}/{cfg.num_updates} start")
 
             # === 여기에 추가 (기존 done_reason_counts 선언 전) ===
@@ -743,6 +876,15 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             for _ in range(num_envs)
             ]
 
+            # GPU buffers (GPU - 임시 누적용) ← 추가!
+            gpu_buffers = [
+                {k: [] for k in [
+                    'boxes','cont_flat','raw_flat','used_mask',
+                    'pos_idx','sel_idx','orient_idx','logp_old','values'
+                ]}
+                for _ in range(num_envs)
+            ]  
+
             # 초기화
             for env in envs:
                 env.cfg.N = N_sampled
@@ -757,28 +899,31 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             # 고정 길이 롤아웃: 정확히 n_steps 스텝 수집
             # --- 최고 UR 스냅샷 추적기 초기화 ---
             best_ur_per_env = [-1.0 for _ in range(num_envs)]
+            last_ur_per_env = [-1.0 for _ in range(num_envs)]
             # (boxes_snapshot(list of tuples), H_tilde(int))
             best_snap_per_env: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
+            last_complete_state: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
 
             for t in range(n_steps):
-                active_envs = list(range(num_envs))  # done 여부 상관없이 모두 참여
+                active_envs = list(range(num_envs))
 
-                # ----- 컨테이너 상태 batch 구성 (병렬 전처리) -----
-                with ThreadPoolExecutor(max_workers=min(8, len(active_envs))) as pool:
-                    futs = [pool.submit(_make_obs_from_env, envs[i]) for i in active_envs]
-                    results = [f.result() for f in futs]
-
-                s7_list, boxes_list, used_mask_list = [], [], []
-                for raw_flat_np, boxes_np, used_np in results:
-                    s7_list.append(raw_flat_np)
-                    boxes_list.append(boxes_np)
-                    used_mask_list.append(used_np)
-
-                # numpy → torch (batch 합치기)
-                raw_flat = torch.from_numpy(np.concatenate(s7_list, axis=0)).float().to(device)   # (B,100,7)
+                # ----- GPU 배치 전처리 (ThreadPool 제거!) -----
+                
+                # 1. NumPy로 수집
+                heightmaps = np.stack([envs[i].height for i in active_envs])  # (B, H, W)
+                boxes_list = [envs[i].boxes for i in active_envs]
+                used_list = [envs[i].used for i in active_envs]
+                
+                # 2. GPU에서 배치 전처리
+                raw_flat = preprocess_batch_gpu(heightmaps, patch=10, device=device)  # (B, 100, 7) on GPU
                 cont_flat = raw_flat
-                boxes = torch.from_numpy(np.concatenate(boxes_list, axis=0)).float().to(device)   # (B,N,3)
-                used_mask = torch.from_numpy(np.concatenate(used_mask_list, axis=0)).to(device)  # (B,N)
+                
+                # 3. Boxes & masks → GPU
+                boxes_arr = np.array([list(b) for b in boxes_list], dtype=np.float32)  # (B, N, 3)
+                used_arr = np.stack(used_list)  # (B, N)
+                
+                boxes = torch.from_numpy(boxes_arr).float().to(device)
+                used_mask = torch.from_numpy(used_arr).to(device)
 
                 # --- Policy batch forward ---
                 with torch.inference_mode():
@@ -791,91 +936,131 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     
                     V: torch.Tensor = cast(torch.Tensor, value(boxes, cont_flat).squeeze(-1))
 
-                # --- 각 env에 step 적용 ---
+                                # --- 각 env에 step 적용 ---
+                
+                # 최적화 1: 배치 변환 (루프 전에 한번만)
+                sel_cpu = sel_idx.cpu().numpy()
+                ori_cpu = orient_idx.cpu().numpy()
+                
                 for j, i in enumerate(active_envs):
                     env = envs[i]
-                    x, y = map(int, xy[j])
+                    x, y = int(xy[j, 0]), int(xy[j, 1])
+                    
+                    # 최적화 2: NumPy 인덱싱 (item() 대신)
                     obs, reward, done, info = env.step((x, y,
-                                                         int(sel_idx[j].item()),
-                                                         int(orient_idx[j].item())))
+                                                         int(sel_cpu[j]),
+                                                         int(ori_cpu[j])))
+                    
                     # --- 모든 스텝 reason 집계 ---
                     step_key = (info or {}).get("reason", "unknown")
                     step_reason_counts[step_key] += 1
-
-                    # --- UR(best) 추적 ---
-                    try:
-                        current_ur = env.utilization_rate()
-                        if current_ur > best_ur_per_env[i]:
-                            best_ur_per_env[i] = current_ur
-                            # placed_boxes는 리스트이므로 스냅샷 복사
-                            boxes_copy = list(env.placed_boxes)
-                            best_snap_per_env[i] = (boxes_copy, env.current_max_height())
-                    except Exception:
-                        pass
-
-                    # Store (현재 스텝의 transition)
-                    trajs[i]['boxes'     ].append(boxes[j:j+1].detach().cpu())
-                    trajs[i]['cont_flat' ].append(cont_flat[j:j+1].detach().cpu())
-                    trajs[i]['raw_flat'  ].append(raw_flat[j:j+1].detach().cpu())
-                    trajs[i]['used_mask' ].append(used_mask[j:j+1].detach().cpu())
-                    trajs[i]['pos_idx'   ].append(pos_idx[j:j+1].detach().cpu())
-                    trajs[i]['sel_idx'   ].append(sel_idx[j:j+1].detach().cpu())
-                    trajs[i]['orient_idx'].append(orient_idx[j:j+1].detach().cpu())
-                    trajs[i]['logp_old'  ].append(logp[j:j+1].detach().cpu())
-                    trajs[i]['rewards'   ].append(torch.tensor([reward], dtype=torch.float32))
-                    trajs[i]['dones'     ].append(torch.tensor([done], dtype=torch.float32))
-                    trajs[i]['values'    ].append(V[j:j+1].detach().cpu())
-
-                    # 마지막 스텝 done 여부를 기록
+                    
+                    # 최적화 3: GPU에 저장 (CPU 전송 안 함!)
+                    gpu_buffers[i]['boxes'].append(boxes[j:j+1])
+                    gpu_buffers[i]['cont_flat'].append(cont_flat[j:j+1])
+                    gpu_buffers[i]['raw_flat'].append(raw_flat[j:j+1])
+                    gpu_buffers[i]['used_mask'].append(used_mask[j:j+1])
+                    gpu_buffers[i]['pos_idx'].append(pos_idx[j:j+1])
+                    gpu_buffers[i]['sel_idx'].append(sel_idx[j:j+1])
+                    gpu_buffers[i]['orient_idx'].append(orient_idx[j:j+1])
+                    gpu_buffers[i]['logp_old'].append(logp[j:j+1])
+                    gpu_buffers[i]['values'].append(V[j:j+1])
+                    
+                    # rewards, dones는 작으니 바로 CPU 저장
+                    trajs[i]['rewards'].append(torch.tensor([reward], dtype=torch.float32))
+                    trajs[i]['dones'].append(torch.tensor([done], dtype=torch.float32))
+                    
                     last_done[i] = bool(done)
-
-                    # done이면 즉시 reset → 다음 스텝 참여
+                    
                     if done:
-                        # --- 종료 이유 수집(끝난 스텝만) ---
                         reason = (info or {}).get("reason", "unknown")
                         detail = (info or {}).get("detail", None)
                         done_reason_counts[reason] += 1
                         if len(done_reason_samples) < cfg.print_first_k_done:
                             done_reason_samples.append((t, i, reason, detail))
+                        # --- UR(best), UR(last) 추적: 완료 시에만 ---
+                        if info.get("reason") == "complete":
+                            # reset 전에 저장
+                            current_ur = env.utilization_rate()
+                            
+                            # best 업데이트
+                            if current_ur > best_ur_per_env[i]:
+                                best_ur_per_env[i] = current_ur
+                                best_snap_per_env[i] = (
+                                    list(env.placed_boxes),
+                                    env.current_max_height()
+                                )
+                            
+                            # last 저장
+                            last_ur_per_env[i] = current_ur
+                            last_complete_state[i] = (
+                                list(env.placed_boxes),
+                                env.current_max_height()
+                            )
                         env.reset()
+                        # (Rollout 루프 끝난 후)
             
-            with ThreadPoolExecutor(max_workers=min(8, num_envs)) as pool:
-                futs = [pool.submit(_make_obs_from_env, envs[i]) for i in range(num_envs)]
-                boot = [f.result() for f in futs]
+            # 최적화 4: GPU → CPU 전송 (한번에!)
+            for i in range(num_envs):
+                # GPU 텐서들 concat → CPU 전송
+                for key in ['boxes', 'cont_flat', 'raw_flat', 'used_mask',
+                           'pos_idx', 'sel_idx', 'orient_idx', 'logp_old', 'values']:
+                    if len(gpu_buffers[i][key]) > 0:
+                        trajs[i][key] = torch.cat(gpu_buffers[i][key], dim=0).cpu()
+                    else:
+                        trajs[i][key] = torch.empty(0)
+                
+                # rewards, dones concat (이미 CPU)
+                if len(trajs[i]['rewards']) > 0:
+                    trajs[i]['rewards'] = torch.cat(trajs[i]['rewards'], dim=0)
+                    trajs[i]['dones'] = torch.cat(trajs[i]['dones'], dim=0)
+                else:
+                    trajs[i]['rewards'] = torch.empty(0)
+                    trajs[i]['dones'] = torch.empty(0)
+            
+            # GPU 버퍼 메모리 해제
+            del gpu_buffers
 
-            boot_s7, boot_boxes = [], []
-            for raw_flat_np, boxes_np, used_np in boot:
-                boot_s7.append(raw_flat_np)
-                boot_boxes.append(boxes_np)
-
-            boot_raw  = torch.from_numpy(np.concatenate(boot_s7, axis=0)).float().to(device)    # (B,100,7)
+            # Bootstrap value calculation - GPU batch processing (same as rollout)
+            heightmaps_boot = np.stack([envs[i].height for i in range(num_envs)])  # (B, H, W)
+            boxes_list_boot = [envs[i].boxes for i in range(num_envs)]
+            
+            # GPU preprocessing
+            boot_raw = preprocess_batch_gpu(heightmaps_boot, patch=10, device=device)  # (B, 100, 7)
             boot_cont = boot_raw
-            boot_box  = torch.from_numpy(np.concatenate(boot_boxes, axis=0)).float().to(device) # (B,N,3)
+            
+            # Boxes to GPU
+            boxes_arr_boot = np.array([list(b) for b in boxes_list_boot], dtype=np.float32)  # (B, N, 3)
+            boot_box = torch.from_numpy(boxes_arr_boot).float().to(device)  # (B, N, 3)
 
             with torch.inference_mode():
-                boot_V = value(boot_box, boot_cont).squeeze(-1).detach().cpu()  # (num_envs,)
+                boot_V = value(boot_box, boot_cont).squeeze(-1).detach().cpu()
 
             # --- 시각화 저장 ---
             if update % cfg.log_interval == 0:
-                # 4-1) 마지막 상태(기존) - env0
-                boxes_last = envs[0].placed_boxes
-                out_base_last = f"results/plots/packing_u{update:05d}"
-                save_packing_3d(boxes_last,
-                                container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
-                                out_path=out_base_last+".png")
-                save_packing_3d_interactive(boxes_last,
-                                container=(env_cfg.L, env_cfg.W, envs[0].current_max_height()),
-                                out_path=out_base_last+".html")
-                # 4-2) 최고 UR 스냅샷(신규) - env0
-                if best_snap_per_env[0] is not None:
-                    best_boxes0, best_H0 = best_snap_per_env[0]
-                    out_base_best = f"results/plots/packing_best_u{update:05d}"
-                    save_packing_3d(best_boxes0,
-                                    container=(env_cfg.L, env_cfg.W, best_H0),
-                                    out_path=out_base_best+".png")
-                    save_packing_3d_interactive(best_boxes0,
-                                    container=(env_cfg.L, env_cfg.W, best_H0),
-                                    out_path=out_base_best+".html")
+                # (1) 마지막 완주 스냅샷
+                if last_complete_state[0] is not None:
+                    last_boxes0, last_H0 = last_complete_state[0]
+                    out_base_last = f"results/plots/packing_u{update:05d}"
+                    save_packing_3d(last_boxes0,
+                                    container=(env_cfg.L, env_cfg.W, last_H0),
+                                    out_path=out_base_last+".png")
+                    save_packing_3d_interactive(last_boxes0,
+                                    container=(env_cfg.L, env_cfg.W, last_H0),
+                                    out_path=out_base_last+".html")
+                # (2) 최고 UR 스냅샷: 모든 env 중 best_ur 최대인 env 선택
+                cand_best = [(i, u) for i, u in enumerate(best_ur_per_env) if u >= 0.0]
+                if cand_best:
+                    env_best_idx = max(cand_best, key=lambda x: x[1])[0]
+                    if best_snap_per_env[env_best_idx] is not None:
+                        best_boxes, best_H = best_snap_per_env[env_best_idx]
+                        out_base_best = f"results/plots/packing_best_u{update:05d}"
+                        save_packing_3d(best_boxes,
+                                        container=(env_cfg.L, env_cfg.W, best_H),
+                                        out_path=out_base_best+".png")
+                        save_packing_3d_interactive(best_boxes,
+                                        container=(env_cfg.L, env_cfg.W, best_H),
+                                        out_path=out_base_best+".html")
 
             # --- 모든 스텝 reason 요약 ---
             if step_reason_counts:
@@ -899,9 +1084,10 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     dprint("[done-reasons] no termination observed in rollout window")
 
             # --- 에피소드 통계 ---
-            return_sum = float(np.mean([sum(r.item() for r in traj['rewards']) for traj in trajs]))
-            ur_last = float(np.mean([env.utilization_rate() for env in envs]))
-            ur_best = float(np.mean([u for u in best_ur_per_env if u >= 0.0])) if any(u >= 0.0 for u in best_ur_per_env) else 0.0
+            return_sum = float(np.mean([trajs[i]['rewards'].sum().item() for i in range(num_envs)]))
+            ur_last = float(np.mean([u for u in last_ur_per_env if u >= 0.0])) if any(u >= 0.0 for u in last_ur_per_env) else 0.0
+            valid = [u for u in best_ur_per_env if u >= 0.0]
+            ur_best = max(valid) if valid else 0.0
             mean_step = float(np.mean([getattr(env, "step_count", 0) for env in envs]))
             mean_invalid = float(np.mean([getattr(env, "invalid_count", 0) for env in envs]))
             dprint(f"[collect] trajectories ready | T={n_steps * num_envs} | "
@@ -909,18 +1095,18 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                    f"step(avg)={mean_step:.1f} | invalid(avg)={mean_invalid:.1f}")
 
             # --- rollout 병합 ---
-            traj = {k: torch.cat([torch.cat(trajs[i][k], dim=0) for i in range(num_envs)], dim=0)
+            traj = {k: torch.cat([trajs[i][k] for i in range(num_envs)], dim=0)
                     for k in trajs[0].keys()}
             
             # === 여기서 '항상' 텐서로 준비 ===
             device_opt = dict(device=device, non_blocking=True)
-            rewards_T      = traj['rewards'   ].squeeze(-1).to(**device_opt)         # (T,)
-            dones_T        = traj['dones'     ].squeeze(-1).to(**device_opt)         # (T,)
-            values_T       = traj['values'    ].squeeze(-1).to(**device_opt)         # (T,)
-            logp_old_T     = traj['logp_old'  ].squeeze(-1).to(**device_opt)         # (T,)
-            pos_idx_T      = traj['pos_idx'   ].squeeze(-1).to(**device_opt).long()  # (T,)
-            sel_idx_T      = traj['sel_idx'   ].squeeze(-1).to(**device_opt).long()  # (T,)
-            orient_idx_T   = traj['orient_idx'].squeeze(-1).to(**device_opt).long()  # (T,)
+            rewards_T      = traj['rewards'   ].squeeze(-1).to(**device_opt)  # CPU→GPU
+            dones_T        = traj['dones'     ].squeeze(-1).to(**device_opt)  # CPU→GPU
+            values_T       = traj['values'    ].squeeze(-1).to(**device_opt)  # 불필요!
+            logp_old_T     = traj['logp_old'  ].squeeze(-1).to(**device_opt)  # 불필요!
+            pos_idx_T      = traj['pos_idx'   ].squeeze(-1).to(**device_opt).long()  # 불필요!
+            sel_idx_T      = traj['sel_idx'   ].squeeze(-1).to(**device_opt).long()  # 불필요!
+            orient_idx_T   = traj['orient_idx'].squeeze(-1).to(**device_opt).long()  # 불필요!
 
             T = n_steps * num_envs
 
@@ -945,11 +1131,11 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             adv_T     = torch.cat(adv_list, dim=0)
             adv_T = (adv_T - adv_T.mean()) / (adv_T.std() + 1e-8)
 
-            # ---- CPU 텐서로 유지 + pinned 준비 ----
-            boxes_B = traj['boxes'].squeeze(1).contiguous().pin_memory()      # (T, N, 3)
-            cont_B  = traj['cont_flat'].squeeze(1).contiguous().pin_memory()  # (T, 100, 7)
-            raw_B   = traj['raw_flat'].squeeze(1).contiguous().pin_memory()   # (T, 100, 7)
-            used_B  = traj['used_mask'].squeeze(1).contiguous().pin_memory()  # (T, N) or (T,)
+            # ---- 최적화: 이미 GPU에 있으므로 그대로 사용 ----
+            boxes_B = traj['boxes'].squeeze(1).contiguous().pin_memory()
+            cont_B  = traj['cont_flat'].squeeze(1).contiguous().pin_memory()
+            raw_B   = traj['raw_flat'].squeeze(1).contiguous().pin_memory()
+            used_B  = traj['used_mask'].squeeze(1).contiguous().pin_memory()
 
             pos_B = pos_idx_T
             sel_B = sel_idx_T
@@ -964,6 +1150,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
             policy.train(); value.train()
 
             for epoch in range(cfg.epochs_per_update):
+                # GPU에서 직접 랜덤 인덱스 생성 (CPU 왕복 제거)
                 idx = torch.randperm(T)
 
                 # 누적을 위해 zero_grad를 에폭 시작에서 1회
@@ -972,10 +1159,9 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
                 mb = 0
                 for start in range(0, T, cfg.batch_size):
-                    b_cpu = idx[start:start+cfg.batch_size]            # CPU index
-                    b_gpu = b_cpu.to(device, non_blocking=True)        # GPU index (GPU 소스용)
+                    b_cpu = idx[start:start+cfg.batch_size]
+                    b_gpu = b_cpu.to(device, non_blocking=True)
 
-                    # --- CPU 소스 (pinned) → CPU 인덱싱 → GPU로 비동기 복사 ---
                     boxes_b = boxes_B.index_select(0, b_cpu).to(device, non_blocking=True)
                     cont_b  = cont_B .index_select(0, b_cpu).to(device, non_blocking=True)
                     raw_b   = raw_B  .index_select(0, b_cpu).to(device, non_blocking=True)
@@ -1001,7 +1187,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                         actor_loss   = -torch.min(surr1, surr2).mean()
 
                         # --- PPO-style value clipping ---
-                        V_old_b = values_T.index_select(0, b_gpu).detach().to(V_pred.dtype)  # 기존 값 고정
+                        V_old_b = values_T.index_select(0, b_gpu).detach().to(V_pred.dtype)
                         value_clip_eps = getattr(cfg, "value_clip_eps", 0.2)
 
                         V_pred_clipped = V_old_b + (V_pred - V_old_b).clamp(-value_clip_eps, value_clip_eps)
@@ -1012,7 +1198,17 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                         critic_loss = torch.max(critic_loss_1, critic_loss_2)
                         
                         entropy_mean = ent.mean()
-                        total_actor_loss = actor_loss - cfg.entropy_coef * entropy_mean
+
+                        # 0..until 구간에서만 선형, 그 이후엔 1.0로 고정
+                        ent_start = cfg.entropy_coef
+                        ent_end   = 0.01
+                        total     = int(cfg.num_updates)
+                        until     = 0.6   # 60%
+
+                        prog_raw = update / float(total - 1) if total > 1 else 1.0       # 0..1
+                        prog = min(1.0, prog_raw / until)                                # 0..1로 압축
+                        entropy_coef_t = ent_start * (1 - prog) + ent_end * prog
+                        total_actor_loss = actor_loss - entropy_coef_t * entropy_mean
                     
                     # --- NaN guard: backward 전에! ---
                     if (not torch.isfinite(actor_loss)) or (not torch.isfinite(critic_loss)) or (not torch.isfinite(entropy_mean)):
@@ -1047,16 +1243,20 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
 
             # --- 로그 ---
             if update % cfg.log_interval == 0:
+                # 그리디 평가 (완주) 스냅샷
+                try:
+                    eval_ret, eval_ur = render_eval(policy, envs[0], device, f"results/plots/eval_u{update:05d}")
+                except Exception as e:
+                    eval_ret, eval_ur = 0.0, 0.0
+                    dprint("[plot] eval render failed:", e)
+
                 dprint(f"[update {update}] T={T} | "
                     f"Stage={stage_info['stage_name']} ({stage_info['progress']:.0%}) | "
                     f"Return={returns_T.sum().item():.1f} | ActorLoss={actor_loss.item():.4f} | CriticLoss={critic_loss.item():.4f} | "
-                    f"Entropy={entropy_mean.item():.4f}")
+                    f"Entropy={entropy_mean.item():.4f} | "
+                    f"EntropyCoef(t)={entropy_coef_t:.6f} | "
+                    f"eval_return={eval_ret:.2f} | eval_UR={eval_ur:.4f}")
                 
-                # 그리디 평가 (완주) 스냅샷
-                try:
-                    render_eval(policy, env_cfg, device, f"results/plots/eval_u{update:05d}")
-                except Exception as e:
-                    dprint("[plot] eval render failed:", e)
             
             # CSV 로그 기록 (누적)
             try:
@@ -1065,7 +1265,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
                     f"{return_sum:.4f}",
                     f"{ur_last:.6f}", f"{ur_best:.6f}",
                     f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_mean.item():.6f}",
-                    f"{mean_step:.2f}", f"{mean_invalid:.2f}"
+                    f"{mean_step:.2f}", f"{mean_invalid:.2f}",
+                    f"{eval_ret:.4f}", f"{eval_ur:.6f}"
                 ])
                 csv_f.flush()
             except Exception as e:
@@ -1104,49 +1305,66 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
         # === 학습 종료 시 자동 플롯 저장 ===
         if MATPLOTLIB_OK:
             try:
-                updates, rets, urs = [], [], []
+                # Train 데이터 (모든 update)
+                updates, rets, urs_last, urs_best = [], [], [], []
+                # Eval 데이터 (0이 아닌 값만, 즉 log_interval에 해당하는 update만)
+                eval_updates, eval_rets, eval_urs = [], [], []
+                
                 with open(log_path, "r", newline="") as f:
                     rd = csv.DictReader(f)
                     for row in rd:
                         try:
-                            x = int(row.get("update"))
-                            updates.append(x)
+                            upd = int(row["update"])
+                            updates.append(upd)
                             rets.append(float(row["return_sum"]))
-                            # 컬럼명 변경 호환: mean_UR_last / mean_UR
-                            urs_last = float(row.get("mean_UR_last", row.get("mean_UR", 0.0)))
-                            urs_best = float(row.get("mean_UR_best", 0.0))
-                            urs.append((urs_last, urs_best))
+                            urs_last.append(float(row.get("mean_UR_last", row.get("mean_UR", 0.0))))
+                            urs_best.append(float(row.get("mean_UR_best", 0.0)))
+                            
+                            # eval 값이 0이 아닌 경우만 별도 리스트에 추가
+                            eval_ret = float(row.get("return_eval", 0.0))
+                            eval_ur = float(row.get("UR_eval", 0.0))
+                            if eval_ret != 0.0 or eval_ur != 0.0:  # 둘 중 하나라도 0이 아니면
+                                eval_updates.append(upd)
+                                eval_rets.append(eval_ret)
+                                eval_urs.append(eval_ur)
                         except Exception:
-                            pass
+                            continue
 
                 out_dir = os.path.join("results", "plots")
                 os.makedirs(out_dir, exist_ok=True)
 
+                # --- Return Plot ---
                 plt.figure()
-                plt.plot(updates, rets)
-                plt.title(f"Return (sum per update) — {run_name}")
-                plt.xlabel("update"); plt.ylabel("return_sum")
-                plt.tight_layout()
-                ret_png = os.path.join(out_dir, f"{run_name}_return.png")
-                plt.savefig(ret_png, dpi=150)
-                plt.close()
-
-                # UR(last) / UR(best) 분리 플롯
-                ur_last_series = [u[0] for u in urs]
-                ur_best_series = [u[1] for u in urs]
-                plt.figure()
-                plt.plot(updates, ur_last_series, label="UR(last)")
-                plt.plot(updates, ur_best_series, label="UR(best)")
-                plt.title(f"Utilization Rate — {run_name}")
-                plt.xlabel("update"); plt.ylabel("UR")
+                plt.plot(updates, rets, label="Train Return", linewidth=1.8)
+                if eval_updates:  # eval 데이터가 있으면
+                    plt.plot(eval_updates, eval_rets, 'o-', label="Eval Return", 
+                            linewidth=1.8, markersize=4, alpha=0.8)
+                plt.title(f"Return (train vs eval) — {run_name}")
+                plt.xlabel("Update")
+                plt.ylabel("Return")
                 plt.legend()
+                plt.grid(True, alpha=0.3)
                 plt.tight_layout()
-                ur_png = os.path.join(out_dir, f"{run_name}_ur.png")
-                plt.savefig(ur_png, dpi=150)
+                plt.savefig(os.path.join(out_dir, f"{run_name}_return.png"), dpi=150)
                 plt.close()
 
-                dprint(f"[plot] saved: {ret_png}")
-                dprint(f"[plot] saved: {ur_png}")
+                # --- UR Plot ---
+                plt.figure()
+                plt.plot(updates, urs_last, label="UR(last)", linewidth=1.8)
+                plt.plot(updates, urs_best, label="UR(best)", linewidth=1.8)
+                if eval_updates:  # eval 데이터가 있으면
+                    plt.plot(eval_updates, eval_urs, 'o-', label="UR(eval)", 
+                            linewidth=1.8, markersize=4, alpha=0.8)
+                plt.title(f"Utilization Rate (train vs eval) — {run_name}")
+                plt.xlabel("Update")
+                plt.ylabel("Utilization Rate")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, f"{run_name}_ur.png"), dpi=150)
+                plt.close()
+
+                dprint(f"[plot] saved return/UR plots with eval curves")
             except Exception as e:
                 dprint("[warn] plotting failed:", e)
         else:

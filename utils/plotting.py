@@ -80,9 +80,10 @@ def save_packing_3d(boxes, container=(100,100,100), out_path="results/plots/pack
     ax = fig.add_subplot(111, projection="3d")
 
     L, W, H = container
+    H_safe = max(1, int(H))
     ax.set_xlim(0, L)
     ax.set_ylim(0, W)
-    ax.set_zlim(0, H)
+    ax.set_zlim(0, H_safe)
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
@@ -116,6 +117,7 @@ def save_packing_3d_interactive(boxes, container=(100,100,100), out_path="result
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     L, W, H = container
+    H_safe = max(1, int(H))
     fig = go.Figure()
 
     # 색상 팔레트 (tab20)
@@ -163,7 +165,7 @@ def save_packing_3d_interactive(boxes, container=(100,100,100), out_path="result
         scene=dict(
             xaxis=dict(range=[0,L]),
             yaxis=dict(range=[0,W]),
-            zaxis=dict(range=[0,H])
+            zaxis=dict(range=[0,H_safe])
         ),
         width=900,
         height=700

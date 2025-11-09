@@ -52,8 +52,6 @@ class PackingEnv:
         self.t = 0
         self._sum_vol = 0  # \sum lwh for placed boxes
         self._g_prev: float = 0.0
-        self._ur_prev: float = 0.0
-        self._H_prev: int = 0
         self.placed_boxes = []   # (x,y,z,l,w,h) 튜플 기록
         self.invalid_penalty = cfg.invalid_penalty
 
@@ -99,9 +97,10 @@ class PackingEnv:
     def _H_tilde(self) -> int:
         return int(self.height.max(initial=0))
 
-    def _gap(self) -> int:
-        # g_i = L*W*H_tilde_i - sum_volumes
-        return int(self.height.sum() - self._sum_vol)
+    def _gap(self) -> float:
+        """Li et al., 2020 정의: g_i = L*W*H̃_i - sum_volumes"""
+        Ht = self._H_tilde()
+        return float(self.L * self.W * Ht) - float(self._sum_vol)
     
     def utilization_rate(self) -> float:
         Ht = self._H_tilde()
@@ -123,8 +122,7 @@ class PackingEnv:
         self.height.fill(0)
         self.t = 0
         self._sum_vol = 0
-        self._g_prev = 0
-        self.placed_boxes = []   # 새로운 에피소드마다 초기화
+        self.placed_boxes = []     # 새로운 에피소드마다 초기화
         self.step_count = 0        # 성공 배치 카운트 초기화        
         self.invalid_count = 0     # 무효 시도 카운트 초기화
         
@@ -135,8 +133,6 @@ class PackingEnv:
         self.used = np.zeros(len(self.boxes), dtype=bool)
         
         self._g_prev = self._gap()
-        self._ur_prev = self.utilization_rate()
-        self._H_prev = self._H_tilde()
 
         obs = {
             "height": self.height.copy(),
@@ -214,10 +210,8 @@ class PackingEnv:
         # 진행: 유효 배치만 성공 카운트 증가
         self.step_count += 1
 
-        # ✅ 배치 전 상태 저장 (height 효율 계산용)
+        # 배치 전 gap
         g_prev = self._g_prev
-        ur_prev = self._ur_prev
-        H_prev = self._H_prev
 
         # 배치 실행
         top = self._max_height_in_region(x, y, l, w)
@@ -231,55 +225,17 @@ class PackingEnv:
         ur_now = self.utilization_rate()
         H_now = self._H_tilde()
 
-        # ===== Reward Shaping =====
-        # 1) Gap 감소 (잠재함수 기반, 최적해 보존)
-        gap_reward = float(g_prev - g_now)
+        # ===== Li et al. (2020) 보상: Δgap 정규화 =====
+        # r_i = (g_{i-1} - g_i) / (W*L)
+        denom = float(self.L * self.W) if (self.L * self.W) > 0 else 1.0
+        reward = float(g_prev - g_now) / denom
 
-        # 2) UR 증분 (중복 제거)
-        K_ur = 20.0
-        ur_reward = (ur_now - ur_prev) * K_ur
-
-        # 3) Height 효율 (간소화 버전) ✅
-        if H_now > H_prev:
-            h_increase = H_now - H_prev
-            
-            # 박스 바닥~상단 중 H_prev 위 부분만 카운트
-            box_top = top + h
-            
-            if box_top <= H_prev:
-                vol_above = 0.0  # 전부 묻힘
-            elif top >= H_prev:
-                vol_above = float(l * w * h)  # 전부 새 슬랩
-            else:
-                # 일부만 H_prev 위로
-                vol_above = float(l * w * (box_top - H_prev))
-            
-            # 새 슬랩 용량 대비 효율
-            slab_capacity = h_increase * self.L * self.W
-            efficiency = vol_above / (slab_capacity + 1e-6)
-            
-            K_h = 5.0
-            height_reward = float(np.clip(K_h * efficiency, 0.0, K_h))
-        else:
-            height_reward = 0.0
-
-        # 4) 완료 보너스
-        if self.used.all():
-            completion_bonus = 50.0 + 50.0 * ur_now
-        else:
-            completion_bonus = 0.0
-
-         # 총 보상
-        reward = gap_reward + ur_reward + height_reward + completion_bonus
-
-        # ✅ 상태 업데이트 (필수!)
+        # ✅ 상태 업데이트
         self._g_prev = g_now
-        self._ur_prev = ur_now
-        self._H_prev = H_now
 
-        # 4) 종료 판정 + reason
+        # 종료 판정
         done = False
-        reason = "placed"  # 정상 배치가 이루어졌고 아직 종료가 아닌 경우의 기본 라벨
+        reason = "placed"
 
         if self.used.all():
             done = True
@@ -300,10 +256,7 @@ class PackingEnv:
             "terminated_by": reason if done else None,
             "ur": ur_now,
             "reward_breakdown": {
-                "gap": float(gap_reward),
-                "ur": float(ur_reward),
-                "height": float(height_reward),
-                "completion": float(completion_bonus),
+                "gap_delta_norm": float(reward),
                 "total": float(reward)
             }
         })
