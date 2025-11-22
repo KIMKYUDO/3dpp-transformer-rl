@@ -90,13 +90,20 @@ from utils.logger import resolve_resume
 from utils.rng_state import get_rng_state, set_rng_state
 from utils.plotting import save_packing_3d, save_packing_3d_interactive
 from utils.curriculum_scheduler import CurriculumScheduler
-from utils.param_noise import apply_parameter_noise, remove_parameter_noise
 from agents.backbone import PolicyBackbone, EncoderConfig
 from agents.heads import (
     PositionDecoder, SelectionDecoder, OrientationDecoder,
-    PositionEmbeddingBuilder, OrientationEmbedder,
+    PositionEmbeddingBuilder, OrientationEmbedder, OffsetHead
 )
 from agents.value_head import ValueNet
+
+# ==== Offset options (간단 상수) ====
+OFFSET_ENABLED   = True     # 오프셋 헤드 사용 여부
+OFFSET_SIGMA     = 0.2      # Δ 가우시안 초기 sigma
+OFFSET_QUANT     = 0.1      # 0 또는 None이면 양자화 없음 / 1.0이면 정수화 / 0.1이면 소수1자리
+OFFSET_CLAMP_ABS = 0.6      # Δ 클리핑 한계 (패치 반경 대비)
+PATCH_SIZE       = 10       # 100→10×10 다운샘플 패치 크기
+GRID_H = GRID_W  = 10       # 다운샘플 그리드 크기
 
 print("CUDA_ALLOC_CONF =", os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
 
@@ -130,8 +137,6 @@ class TrainConfig:
     entropy_coef: float = 1e-3
     value_clip_eps: float = 0.2
     critic_loss_type: str = "clipped_mse"
-    kl_stop: float = 0.03
-    clipfrac_stop: float = 0.35
     # LR
     lr_actor: float = 1e-5
     lr_critic: float = 1e-4
@@ -149,12 +154,6 @@ class TrainConfig:
     # Debug / Reason logging
     log_done_reasons_every: int = 1   # 매 몇 update마다 요약 출력할지
     print_first_k_done: int = 256      # 조기 종료 샘플 상세 로그 개수 제한
-
-    # Parameter noise (exploration)
-    param_noise_std: float = 0.0   # 0이면 사용 안 함
-
-    # ★ 추가: 300에서 시작할 때 사용할 베이스 체크포인트 경로
-    pretrain_ckpt: str | None = None
 
 # ------------------------------------------------------------
 # YAML 로더 유틸
@@ -177,6 +176,24 @@ class PolicyNet(nn.Module):
         self.sel_dec = SelectionDecoder(d_model=d_model, nhead=8, num_layers=2)
         self.orient_embed = OrientationEmbedder(d_model=d_model)
         self.orient_dec = OrientationDecoder(d_model=d_model, nhead=8, num_layers=2)
+        # === Offset head ===
+        if OFFSET_ENABLED:
+            self.offset_head = OffsetHead(d_model=d_model, sigma_init=OFFSET_SIGMA)
+        else:
+            self.offset_head = None
+    
+    @staticmethod
+    def _gather_patch_token(patch_tokens: torch.Tensor, px: torch.Tensor, py: torch.Tensor,
+                            grid_h: int = GRID_H, grid_w: int = GRID_W) -> torch.Tensor:
+        """
+        patch_tokens: (B, grid_h*grid_w, d)
+        px, py: (B,)  # 선택된 패치 인덱스
+        return: (B, d)
+        """
+        B, N, d = patch_tokens.shape
+        idx = py * grid_w + px                # (B,)
+        idx = idx.view(-1, 1).expand(-1, d)   # (B, d)
+        return patch_tokens.gather(1, idx.unsqueeze(1)).squeeze(1)  # (B, d)
 
     @staticmethod
     def _pos_index_to_xy(idx: torch.Tensor, patch: int = 10) -> torch.Tensor:
@@ -221,12 +238,12 @@ class PolicyNet(nn.Module):
         
         # (100, 2) with (x, y) 순서
         grid = torch.stack([
-            x_coords.repeat(len(y_coords)),              # [0,10,...,90, 0,10,...,90, ...] (x 빠름)
-            y_coords.repeat_interleave(len(x_coords)),   # [0,0,...,0, 10,10,...,10, ...] (y 느림)
+            x_coords.repeat_interleave(len(y_coords)),
+            y_coords.repeat(len(x_coords))
         ], dim=1)  # (100, 2) - (x, y)
 
-        remaining_L = (container_L - grid[:, 0]).view(1, 1, 1, 100)  # (1,1,1,100)
-        remaining_W = (container_W - grid[:, 1]).view(1, 1, 1, 100)  # (1,1,1,100)
+        remaining_L = (container_L - grid[:, 1]).view(1, 1, 1, 100)  # (1,1,1,100)
+        remaining_W = (container_W - grid[:, 0]).view(1, 1, 1, 100)  # (1,1,1,100)
 
         # 2) 6가지 회전의 2D 풋프린트 (l,w) 쌍을 전부 생성
         l, w, h = boxes[..., 0], boxes[..., 1], boxes[..., 2]          # (B,N)
@@ -361,6 +378,7 @@ class PolicyNet(nn.Module):
         B, N, _ = boxes.shape
 
         box_enc, cont_enc = self.backbone(boxes, cont_flat)
+        container_tokens = cont_enc
         
         # Position
         logits_pos, ctx = self.pos_dec(cont_enc, box_enc)
@@ -632,13 +650,10 @@ def init_csv_and_offset(run_name: str) -> Tuple[csv.writer, any, str, int]:
     log_path = os.path.join(log_dir, f"{run_name}.csv")
 
     header = ["run","ts","update","T",
-              "return_sum","mean_UR_last",
-            #   "mean_ur_best",
+              "return_sum","mean_UR_last","mean_UR_best",
               "actor_loss","critic_loss","entropy",
               "mean_step","mean_invalid",
-              "return_eval","UR_eval",
-              "return_eval_fixed", "UR_eval_fixed",
-              "skip_epoch","approx_kl","approx_kl_std","clip_frac"]
+              "return_eval","UR_eval"]
     offset = 0
     file_exists = os.path.exists(log_path) and os.path.getsize(log_path) > 0
 
@@ -800,7 +815,7 @@ def render_eval(policy : PolicyNet, env : PackingEnv, device : torch.device,
 # Training loop
 # ------------------------------------------------------------
 
-def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interrupt: bool = False):
+def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str):
     dprint(f"[init] num_updates={cfg.num_updates}, epochs_per_update={cfg.epochs_per_update}, batch_size={cfg.batch_size}")
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
@@ -826,13 +841,6 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
     envs = [PackingEnv(env_cfg) for _ in range(num_envs)]
     dprint(f"[env] {num_envs} PackingEnv initialized")
 
-    # === 고정 박스셋 생성 (평가용) ===
-    eval_fixed_env = PackingEnv(env_cfg)
-    eval_fixed_env.cfg.N = 20  # 고정된 박스 개수
-    eval_fixed_env.reset()
-    fixed_boxes = eval_fixed_env.boxes.copy()  # 고정 박스셋 저장
-    dprint(f"[eval] Fixed boxset created: {len(fixed_boxes)} boxes for greedy evaluation")
-
     policy = PolicyNet(d_model=128).to(device)
     value = ValueNet(EncoderConfig(d_model=128, nhead=4, num_layers=2), d_model=128, nhead=8, num_layers=2).to(device)
 
@@ -843,19 +851,6 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
     scaler_actor = GradScaler(enabled=(device.type == "cuda"))
     scaler_critic = GradScaler(enabled=(device.type == "cuda"))
 
-    # CSV 로거 준비 이후 부분에 있을 pretrain 블록
-    if base_offset == 0 and getattr(cfg, "pretrain_ckpt", None):
-        dprint(f"[pretrain] trying to load {cfg.pretrain_ckpt}")
-        ckpt_pre = torch.load(
-            cfg.pretrain_ckpt,
-            map_location=device,
-            weights_only=False,   # ★ 여기 추가
-        )
-        policy.load_state_dict(ckpt_pre["policy"])
-        value.load_state_dict(ckpt_pre["value"])
-        dprint(f"[pretrain] loaded weights from {cfg.pretrain_ckpt}")
-
-    
     # === Resume-safe 학습 초기화 ===
     last_milestone, ckpt_path = resolve_resume(cfg, run_name, log_path)
     if last_milestone > 0 and ckpt_path:
@@ -875,7 +870,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
     dprint("[start] training loop")
     try:
         for update in range(start_update, cfg.num_updates + 1):
-            eval_ret, eval_ur, eval_ret_fixed, eval_ur_fixed = 0.0, 0.0, 0.0, 0.0
+            eval_ret, eval_ur = 0.0, 0.0
             dprint(f"[loop] update {update}/{cfg.num_updates} start")
 
             # === 여기에 추가 (기존 done_reason_counts 선언 전) ===
@@ -928,15 +923,12 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
 
             last_done = [False] * num_envs
 
-            # --- Parameter noise (이 update 동안만 탐색용) ---
-            param_noise = apply_parameter_noise(policy, cfg.param_noise_std)
-
             # 고정 길이 롤아웃: 정확히 n_steps 스텝 수집
             # --- 최고 UR 스냅샷 추적기 초기화 ---
-            # best_ur_per_env = [-1.0 for _ in range(num_envs)]
+            best_ur_per_env = [-1.0 for _ in range(num_envs)]
             last_ur_per_env = [-1.0 for _ in range(num_envs)]
             # (boxes_snapshot(list of tuples), H_tilde(int))
-            # best_snap_per_env: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
+            best_snap_per_env: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
             last_complete_state: List[Tuple[List[Tuple[int,int,int,int,int,int]], int] | None] = [None for _ in range(num_envs)]
 
             for t in range(n_steps):
@@ -1018,13 +1010,13 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                             # reset 전에 저장
                             current_ur = env.utilization_rate()
                             
-                            # # best 업데이트
-                            # if current_ur > best_ur_per_env[i]:
-                            #     best_ur_per_env[i] = current_ur
-                            #     best_snap_per_env[i] = (
-                            #         list(env.placed_boxes),
-                            #         env.current_max_height()
-                            #     )
+                            # best 업데이트
+                            if current_ur > best_ur_per_env[i]:
+                                best_ur_per_env[i] = current_ur
+                                best_snap_per_env[i] = (
+                                    list(env.placed_boxes),
+                                    env.current_max_height()
+                                )
                             
                             # last 저장
                             last_ur_per_env[i] = current_ur
@@ -1083,19 +1075,19 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                     save_packing_3d_interactive(last_boxes0,
                                     container=(env_cfg.L, env_cfg.W, last_H0),
                                     out_path=out_base_last+".html")
-                # # (2) 최고 UR 스냅샷: 모든 env 중 best_ur 최대인 env 선택
-                # cand_best = [(i, u) for i, u in enumerate(best_ur_per_env) if u >= 0.0]
-                # if cand_best:
-                #     env_best_idx = max(cand_best, key=lambda x: x[1])[0]
-                #     if best_snap_per_env[env_best_idx] is not None:
-                #         best_boxes, best_H = best_snap_per_env[env_best_idx]
-                #         out_base_best = f"results/plots/packing_best_u{update:05d}"
-                #         save_packing_3d(best_boxes,
-                #                         container=(env_cfg.L, env_cfg.W, best_H),
-                #                         out_path=out_base_best+".png")
-                #         save_packing_3d_interactive(best_boxes,
-                #                         container=(env_cfg.L, env_cfg.W, best_H),
-                #                         out_path=out_base_best+".html")
+                # (2) 최고 UR 스냅샷: 모든 env 중 best_ur 최대인 env 선택
+                cand_best = [(i, u) for i, u in enumerate(best_ur_per_env) if u >= 0.0]
+                if cand_best:
+                    env_best_idx = max(cand_best, key=lambda x: x[1])[0]
+                    if best_snap_per_env[env_best_idx] is not None:
+                        best_boxes, best_H = best_snap_per_env[env_best_idx]
+                        out_base_best = f"results/plots/packing_best_u{update:05d}"
+                        save_packing_3d(best_boxes,
+                                        container=(env_cfg.L, env_cfg.W, best_H),
+                                        out_path=out_base_best+".png")
+                        save_packing_3d_interactive(best_boxes,
+                                        container=(env_cfg.L, env_cfg.W, best_H),
+                                        out_path=out_base_best+".html")
 
             # --- 모든 스텝 reason 요약 ---
             if step_reason_counts:
@@ -1121,13 +1113,12 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
             # --- 에피소드 통계 ---
             return_sum = float(np.mean([trajs[i]['rewards'].sum().item() for i in range(num_envs)]))
             ur_last = float(np.mean([u for u in last_ur_per_env if u >= 0.0])) if any(u >= 0.0 for u in last_ur_per_env) else 0.0
-            # valid = [u for u in best_ur_per_env if u >= 0.0]
-            # ur_best = max(valid) if valid else 0.0
+            valid = [u for u in best_ur_per_env if u >= 0.0]
+            ur_best = max(valid) if valid else 0.0
             mean_step = float(np.mean([getattr(env, "step_count", 0) for env in envs]))
             mean_invalid = float(np.mean([getattr(env, "invalid_count", 0) for env in envs]))
             dprint(f"[collect] trajectories ready | T={n_steps * num_envs} | "
-                   f"return={return_sum:.2f} | UR(last)={ur_last:.4f} | "
-                #    f"UR(best)={ur_best:.4f} | "
+                   f"return={return_sum:.2f} | UR(last)={ur_last:.4f} | UR(best)={ur_best:.4f} | "
                    f"step(avg)={mean_step:.1f} | invalid(avg)={mean_invalid:.1f}")
 
             # --- rollout 병합 ---
@@ -1167,28 +1158,6 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
             adv_T     = torch.cat(adv_list, dim=0)
             adv_T = (adv_T - adv_T.mean()) / (adv_T.std() + 1e-8)
 
-            # --- Parameter noise 제거 (θ̃ → θ 복원) ---
-            remove_parameter_noise(policy, param_noise)
-            param_noise = None
-
-             # 🔎 여기 사이에 디버그 코드 넣기
-            if update % 50 == 1 and cfg.param_noise_std > 0:
-                before = [p.detach().clone() for p in policy.parameters()]
-                tmp_noise = apply_parameter_noise(policy, cfg.param_noise_std)
-                after_noise = [p.detach().clone() for p in policy.parameters()]
-                remove_parameter_noise(policy, tmp_noise)
-                after_restore = [p.detach().clone() for p in policy.parameters()]
-
-                max_diff_noise = max(
-                    (b - n).abs().max().item()
-                    for b, n in zip(before, after_noise)
-                )
-                max_diff_restore = max(
-                    (b - r).abs().max().item()
-                    for b, r in zip(before, after_restore)
-                )
-                print(f"[DEBUG] param_noise Δθ={max_diff_noise:.3e}, restore_err={max_diff_restore:.3e}")
-
             # ---- 최적화: 이미 GPU에 있으므로 그대로 사용 ----
             boxes_B = traj['boxes'].squeeze(1).contiguous().pin_memory()
             cont_B  = traj['cont_flat'].squeeze(1).contiguous().pin_memory()
@@ -1207,10 +1176,8 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
 
             policy.train(); value.train()
 
-            skip_epoch=0
-
             for epoch in range(cfg.epochs_per_update):
-                approx_kls, clip_fracs, approx_kls_std = [], [], []
+                approx_kls, clip_fracs = [], []
                 idx = torch.randperm(T)
 
                 # 누적을 위해 zero_grad를 에폭 시작에서 1회
@@ -1247,11 +1214,9 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                         actor_loss   = -torch.min(surr1, surr2).mean()
 
                         approx_kl_batch = (logp_old_b - logp_new).mean()                   # 스칼라
-                        approx_kl_batch_std = (logp_old_b - logp_new).std()
                         clip_frac_batch = ((ratio - 1.0).abs() > cfg.ppo_clip).float().mean()
 
                         approx_kls.append(approx_kl_batch.detach())
-                        approx_kls_std.append(approx_kl_batch_std.detach())
                         clip_fracs.append(clip_frac_batch.detach())
 
                         # --- PPO-style value clipping ---
@@ -1261,15 +1226,15 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                         V_pred_clipped = V_old_b + (V_pred - V_old_b).clamp(-value_clip_eps, value_clip_eps)
                         
                         rets_b = rets_b.to(V_pred.dtype)  # 손실 계산 dtype 통일
-                        critic_loss_1 = F.smooth_l1_loss(V_pred, rets_b)
-                        critic_loss_2 = F.smooth_l1_loss(V_pred_clipped, rets_b)
+                        critic_loss_1 = F.mse_loss(V_pred, rets_b)
+                        critic_loss_2 = F.mse_loss(V_pred_clipped, rets_b)
                         critic_loss = torch.max(critic_loss_1, critic_loss_2)
                         
                         entropy_mean = ent.mean()
 
                         # 0..until 구간에서만 선형, 그 이후엔 1.0로 고정
                         ent_start = cfg.entropy_coef
-                        ent_end   = 0.005
+                        ent_end   = 0.01
                         total     = int(cfg.num_updates)
                         until     = 0.6   # 60%
 
@@ -1311,31 +1276,23 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                 
                 # <<< 여기! 미니배치 루프 종료 직후 에폭 평균 계산 >>>
                 approx_kl_epoch  = torch.stack(approx_kls).mean().item() if approx_kls else 0.0
-                approx_kl_std_epoch = torch.stack(approx_kls_std).mean().item() if approx_kls_std else 0.0
                 clip_frac_epoch  = torch.stack(clip_fracs).mean().item() if clip_fracs else 0.0
-
-                if (approx_kl_epoch > cfg.kl_stop) or (clip_frac_epoch > cfg.clipfrac_stop):
-                    skip_epoch=epoch+1
-                    dprint(f"[ppo] early stopping at epoch {skip_epoch} due to approx_kl")
-                    break  # 이번 업데이트에서 '추가 에폭'을 중단 (다음 에폭으로 가지 않음)
-
 
             # --- 로그 ---
             if update % cfg.log_interval == 0:
                 # 그리디 평가 (완주) 스냅샷
                 try:
                     eval_ret, eval_ur = render_eval(policy, envs[0], device, f"results/plots/eval_u{update:05d}")
-                    eval_ret_fixed, eval_ur_fixed = render_eval(policy, eval_fixed_env, device, f"results/plots/eval_fixed_u{update:05d}")
                 except Exception as e:
-                    eval_ret, eval_ur, eval_ret_fixed, eval_ur_fixed = 0.0, 0.0, 0.0, 0.0
+                    eval_ret, eval_ur = 0.0, 0.0
                     dprint("[plot] eval render failed:", e)
 
                 dprint(f"[update {update}] T={T} | "
                     f"Stage={stage_info['stage_name']} ({stage_info['progress']:.0%}) | "
                     f"Return={returns_T.sum().item():.1f} | ActorLoss={actor_loss.item():.4f} | CriticLoss={critic_loss.item():.4f} | "
                     f"Entropy={entropy_mean.item():.4f} | "
-                    f"EntropyCoef(t)={entropy_coef_t:.6f} | skip_epoch={skip_epoch:d} | "
-                    f"approx_KL={approx_kl_epoch:.4f} | approx_KL_std={approx_kl_std_epoch:.4f} | clip_frac={clip_frac_epoch:.3f} | "
+                    f"EntropyCoef(t)={entropy_coef_t:.6f} | "
+                    f"approx_KL={approx_kl_epoch:.4f} | clip_frac={clip_frac_epoch:.3f} | "
                     f"eval_return={eval_ret:.2f} | eval_UR={eval_ur:.4f}")
                 
             
@@ -1344,13 +1301,11 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                 csv_w.writerow([
                     run_name, session_tag, update, T,
                     f"{return_sum:.4f}",
-                    f"{ur_last:.6f}",
-                    # f"{ur_best:.6f}",
+                    f"{ur_last:.6f}", f"{ur_best:.6f}",
                     f"{actor_loss.item():.6f}", f"{critic_loss.item():.6f}", f"{entropy_mean.item():.6f}",
                     f"{mean_step:.2f}", f"{mean_invalid:.2f}",
                     f"{eval_ret:.4f}", f"{eval_ur:.6f}",
-                    f"{eval_ret_fixed:.4f}", f"{eval_ur_fixed:.6f}",
-                    f"{skip_epoch:d}", f"{approx_kl_epoch:.6f}", f"{approx_kl_std_epoch:.6f}", f"{clip_frac_epoch:.6f}"
+                    f"{approx_kl_epoch:.6f}", f"{clip_frac_epoch:.6f}"
                 ])
                 csv_f.flush()
             except Exception as e:
@@ -1374,13 +1329,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
 
     except KeyboardInterrupt:
         dprint("[interrupt] Training interrupted by user (Ctrl+C)")
-        if ckpt_path is not None:
-            dprint(f"[save] interrupted ckpt saved: {ckpt_path}")
-        else:
-            dprint("[save] interrupted before any milestone ckpt was saved.")
-        if propagate_interrupt:
-            # HPO에서는 바로 밖으로 다시 던져서 "파일 전체"를 멈추게 한다
-            raise
+        dprint(f"[save] interrupted ckpt saved: {ckpt_path}")
 
     except Exception:
         dprint("[fatal] exception in training loop")
@@ -1396,11 +1345,9 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
         if MATPLOTLIB_OK:
             try:
                 # Train 데이터 (모든 update)
-                updates, rets, urs_last = [], [], []
-                # urs_best = []
+                updates, rets, urs_last, urs_best = [], [], [], []
                 # Eval 데이터 (0이 아닌 값만, 즉 log_interval에 해당하는 update만)
                 eval_updates, eval_rets, eval_urs = [], [], []
-                eval_rets_fixed, eval_urs_fixed = [], []
                 
                 with open(log_path, "r", newline="") as f:
                     rd = csv.DictReader(f)
@@ -1410,19 +1357,15 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                             updates.append(upd)
                             rets.append(float(row["return_sum"]))
                             urs_last.append(float(row.get("mean_UR_last", row.get("mean_UR", 0.0))))
-                            # urs_best.append(float(row.get("mean_UR_best", 0.0)))
+                            urs_best.append(float(row.get("mean_UR_best", 0.0)))
                             
                             # eval 값이 0이 아닌 경우만 별도 리스트에 추가
                             eval_ret = float(row.get("return_eval", 0.0))
                             eval_ur = float(row.get("UR_eval", 0.0))
-                            eval_ret_fixed = float(row.get("return_eval_fixed", 0.0))
-                            eval_ur_fixed = float(row.get("UR_eval_fixed", 0.0))
                             if eval_ret != 0.0 or eval_ur != 0.0:  # 둘 중 하나라도 0이 아니면
                                 eval_updates.append(upd)
                                 eval_rets.append(eval_ret)
                                 eval_urs.append(eval_ur)
-                                eval_rets_fixed.append(eval_ret_fixed)
-                                eval_urs_fixed.append(eval_ur_fixed)
                         except Exception:
                             continue
 
@@ -1435,9 +1378,7 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                 if eval_updates:  # eval 데이터가 있으면
                     plt.plot(eval_updates, eval_rets, 'o-', label="Eval Return", 
                             linewidth=1.8, markersize=4, alpha=0.8)
-                    plt.plot(eval_updates, eval_rets_fixed, 's--', label="Eval Return (Fixed N)", 
-                            linewidth=1.8, markersize=4, alpha=0.8)
-                plt.title(f"Return (train vs eval vs eval_fixed ) — {run_name}")
+                plt.title(f"Return (train vs eval) — {run_name}")
                 plt.xlabel("Update")
                 plt.ylabel("Return")
                 plt.legend()
@@ -1449,11 +1390,9 @@ def train(cfg: TrainConfig, env_cfg: EnvConfig, run_name: str, propagate_interru
                 # --- UR Plot ---
                 plt.figure()
                 plt.plot(updates, urs_last, label="UR(last)", linewidth=1.8)
-                # plt.plot(updates, urs_best, label="UR(best)", linewidth=1.8)
+                plt.plot(updates, urs_best, label="UR(best)", linewidth=1.8)
                 if eval_updates:  # eval 데이터가 있으면
                     plt.plot(eval_updates, eval_urs, 'o-', label="UR(eval)", 
-                            linewidth=1.8, markersize=4, alpha=0.8)
-                    plt.plot(eval_updates, eval_urs_fixed, 's--', label="UR(eval_fixed N)",
                             linewidth=1.8, markersize=4, alpha=0.8)
                 plt.title(f"Utilization Rate (train vs eval) — {run_name}")
                 plt.xlabel("Update")
@@ -1501,14 +1440,11 @@ if __name__ == "__main__":
         opt = train_y.get("optimizer", {})
         sch = train_y.get("schedule", {})
         amp = train_y.get("amp", {})
-        noise = train_y.get("parameter_noise", {})
 
-        tcfg.gamma         = float(ppo.get("gamma", tcfg.gamma))
-        tcfg.gae_lambda    = float(ppo.get("gae_lambda", tcfg.gae_lambda))
-        tcfg.ppo_clip      = float(ppo.get("clip_epsilon", tcfg.ppo_clip))
-        tcfg.entropy_coef  = float(ppo.get("entropy_coef", tcfg.entropy_coef))
-        tcfg.kl_stop       = float(ppo.get("kl_stop", tcfg.kl_stop))
-        tcfg.clipfrac_stop = float(ppo.get("clipfrac_stop", tcfg.clipfrac_stop))
+        tcfg.gamma        = float(ppo.get("gamma", tcfg.gamma))
+        tcfg.gae_lambda   = float(ppo.get("gae_lambda", tcfg.gae_lambda))
+        tcfg.ppo_clip     = float(ppo.get("clip_epsilon", tcfg.ppo_clip))
+        tcfg.entropy_coef = float(ppo.get("entropy_coef", tcfg.entropy_coef))
 
         tcfg.lr_actor     = float(opt.get("policy_lr", tcfg.lr_actor))
         tcfg.lr_critic    = float(opt.get("value_lr", tcfg.lr_critic))
@@ -1521,15 +1457,11 @@ if __name__ == "__main__":
         tcfg.save_interval     = int(sch.get("save_interval", tcfg.save_interval))
 
         tcfg.grad_accum_steps = int(amp.get("grad_accum_steps", tcfg.grad_accum_steps))
-        
-        tcfg.param_noise_std  = float(noise.get("std", tcfg.param_noise_std))
 
-        dprint(f"[cfg] train.yaml loaded → n_step={tcfg.n_steps} | updates={tcfg.num_updates} | epochs={tcfg.epochs_per_update} | "
-               f"batch={tcfg.batch_size} | log_interval={tcfg.log_interval} | save_interval={tcfg.save_interval} | grad_accum_steps={tcfg.grad_accum_steps} | "
-               f"gamma={tcfg.gamma} | clip={tcfg.ppo_clip} | entropy_coef={tcfg.entropy_coef} | "
-               f"tcfg.kl_stop={tcfg.kl_stop} | clipfrac_stop={tcfg.clipfrac_stop} | "
-               f"lr_actor={tcfg.lr_actor} | lr_critic={tcfg.lr_critic} | "
-               f"param_noise_std={tcfg.param_noise_std}")
+        dprint(f"[cfg] train.yaml loaded → n_step={tcfg.n_steps}, updates={tcfg.num_updates}, epochs={tcfg.epochs_per_update}, "
+               f"batch={tcfg.batch_size}, log_interval={tcfg.log_interval}, save_interval={tcfg.save_interval}, grad_accum_steps={tcfg.grad_accum_steps} | "
+               f"gamma={tcfg.gamma}, clip={tcfg.ppo_clip}, entropy_coef={tcfg.entropy_coef}, "
+               f"lr_actor={tcfg.lr_actor}, lr_critic={tcfg.lr_critic}")
     except Exception as e:
         dprint("[cfg] train.yaml not loaded, using defaults:", e)
     # -----------------------------------

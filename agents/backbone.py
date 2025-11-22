@@ -60,10 +60,12 @@ class MLP(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 2):
+    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
-                                           dim_feedforward=4*d_model, batch_first=True)
+                                           dim_feedforward=4*d_model, 
+                                           dropout=dropout, batch_first=True,
+                                           norm_first=True )
         self.enc = nn.TransformerEncoder(layer, num_layers=num_layers)
     def forward(self, x):  # x: (B, L, d)
         return self.enc(x)
@@ -78,6 +80,7 @@ class EncoderConfig:
     d_model: int = 128
     nhead: int = 4
     num_layers: int = 2
+    dropout: float = 0.1
     grid_hw: tuple[int, int] = (10, 10)  # for container (downsampled 10x10)
 
 
@@ -87,12 +90,13 @@ class BoxEncoder(nn.Module):
     Procedure (per paper): embed each of l, w, h to d_model → average → TransformerEncoder
     Output: (B, N, d_model)
     """
-    def __init__(self, cfg: EncoderConfig):
+    def __init__(self, cfg: EncoderConfig, use_checkpoint: bool = True):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         d = cfg.d_model
         # scalar → d_model (shared for l,w,h)
         self.scalar_mlp = MLP(1, d, d)
-        self.enc = TransformerEncoder(d_model=d, nhead=cfg.nhead, num_layers=cfg.num_layers)
+        self.enc = TransformerEncoder(d_model=d, nhead=cfg.nhead, num_layers=cfg.num_layers, dropout=cfg.dropout)
 
     def forward(self, boxes: torch.Tensor) -> torch.Tensor:
         # boxes: (B, N, 3)
@@ -101,7 +105,10 @@ class BoxEncoder(nn.Module):
         x = boxes.unsqueeze(-1)            # (B, N, 3, 1)
         x = self.scalar_mlp(x)             # (B, N, 3, d)
         x = x.mean(dim=2)                  # (B, N, d)  (average over {l,w,h})
-        x = checkpoint(self.enc, x, use_reentrant=False)        # GPU memory efficient
+        if self.use_checkpoint and self.training:
+            x = checkpoint(self.enc, x, use_reentrant=False)
+        else:
+            x = self.enc(x)  # 더 빠름!
         return x
 
 
@@ -119,16 +126,20 @@ class ContainerEncoder(nn.Module):
         assert H * W == 100, "expected 10x10 downsampled grid → 100 tokens"
 
         self.proj = MLP(7, self.d, self.d)
-        pos = _build_2d_sincos_pos_embed(H, W, self.d)      # (100, d)
+        with torch.no_grad():
+            pos = _build_2d_sincos_pos_embed(H, W, self.d).to(torch.get_default_dtype())      # (100, d)
         self.register_buffer('pos', pos.unsqueeze(0), persistent=False)  # (1, 100, d)
-        self.enc = TransformerEncoder(d_model=self.d, nhead=cfg.nhead, num_layers=cfg.num_layers)
+        self.enc = TransformerEncoder(d_model=self.d, nhead=cfg.nhead, num_layers=cfg.num_layers, dropout=cfg.dropout)
 
     def forward(self, cont_feat: torch.Tensor) -> torch.Tensor:
         # cont_feat: (B, 100, 7)
         assert cont_feat.dim() == 3 and cont_feat.size(1) == 100 and cont_feat.size(-1) == 7
         x = self.proj(cont_feat)           # (B, 100, d)
-        x = x + self.pos                   # add fixed positional encoding
-        x = checkpoint(self.enc, x, use_reentrant=False)        # GPU memory efficient
+        x = x + self.pos.to(dtype=x.dtype, device=x.device)                   # add fixed positional encoding
+        if self.training:
+            x = checkpoint(self.enc, x, use_reentrant=False)
+        else:
+            x = self.enc(x)
         return x
 
 

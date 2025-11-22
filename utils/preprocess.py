@@ -24,10 +24,10 @@ def compute_plane_features(heightmap: torch.Tensor) -> torch.Tensor:
     state7 : torch.Tensor of shape (H, W, 7), dtype float32
         Seven feature channels:
         0: h_ij    (height)
-        1: e_l     (distance to left boundary)
-        2: e_w     (distance to top boundary)
-        3: e_-l    (distance to right boundary)
-        4: e_-w    (distance to bottom boundary)
+        1: e_l     (distance to right boundary)
+        2: e_w     (distance to bottom boundary)
+        3: e_-l    (distance to left boundary)
+        4: e_-w    (distance to top boundary)
         5: f_l     (forward run distance along +x)
         6: f_w     (forward run distance along +y)
         
@@ -49,10 +49,11 @@ def compute_plane_features(heightmap: torch.Tensor) -> torch.Tensor:
     xs = torch.arange(W, device=device, dtype=torch.float32)
     ys = torch.arange(H, device=device, dtype=torch.float32)
     
-    e_l = xs[None, :].expand(H, W).clone()           # 0..W-1 across columns
-    e_w = ys[:, None].expand(H, W).clone()           # 0..H-1 down rows
-    e_ml = (W - 1 - xs)[None, :].expand(H, W).clone()  # W-1..0 across columns
-    e_mw = (H - 1 - ys)[:, None].expand(H, W).clone()  # H-1..0 down rows
+    e_l = (W - 1 - xs)[None, :].expand(H, W).clone()  # W-1..0 across columns
+    e_w = (H - 1 - ys)[:, None].expand(H, W).clone()  # H-1..0 down rows
+    e_ml = xs[None, :].expand(H, W).clone()           # 0..W-1 across columns
+    e_mw = ys[:, None].expand(H, W).clone()           # 0..H-1 down rows
+
     
     # ========================================
     # 2. Forward distances (복잡하지만 여기서 처리)

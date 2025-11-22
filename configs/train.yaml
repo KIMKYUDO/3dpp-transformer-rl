@@ -2,10 +2,12 @@
 ppo:
   gamma: 0.99
   gae_lambda: 0.96 # 0.90 → 0.96 (더 긴 보상 고려)
-  clip_epsilon: 0.12
-  entropy_coef: 0.06  # 선형 감소
+  clip_epsilon: 0.12  # 0.2
+  entropy_coef: 0.001  # 선형 감소
   value_coef: 0.5
   max_grad_norm: 0.5
+  kl_stop: 0.05           # 0.05
+  clipfrac_stop: 0.6     # 0.6
 
 optimizer:
   policy_lr: 1e-5
@@ -13,12 +15,15 @@ optimizer:
   weight_decay: 0.0
 
 schedule:
-  n_steps: 240           # 각 환경에서 수집할 스텝 수 (논문에서는 2048, 병렬 env로 커버)
-  num_updates: 10000        # 전체 업데이트 횟수
-  epochs_per_update: 4      # 업데이트당 에포크 반복 (논문도 4번 사용)
-  batch_size: 960           # PPO minibatch 크기 (병렬 env에서 trajectory 합쳐 분할)
-  log_interval: 50           # 2 업데이트마다 로그/시각화
-  save_interval: 50          # 2 업데이트마다 ckpt 저장
+  n_steps: 60           # 각 환경에서 수집할 스텝 수
+  num_updates: 15000        # 전체 업데이트 횟수
+  epochs_per_update: 3      # 업데이트당 에포크 반복 횟수
+  batch_size: 240           # PPO minibatch 크기 (병렬 env에서 trajectory 합쳐 분할)
+  log_interval: 10           # 10 업데이트마다 로그/시각화
+  save_interval: 10          # 10 업데이트마다 ckpt 저장
 
 amp:
   grad_accum_steps: 1       # 그래디언트 누적 스텝 (메모리 부족 시 >1로 설정)
+
+parameter_noise:
+  std: 0   # 처음엔 0.01 ~ 0.02 정도로 시작 추천  

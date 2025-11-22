@@ -37,23 +37,23 @@ class CurriculumScheduler:
             self.stages = [
                 CurriculumStage(
                     name="Stage1_Easy",
-                    box_count_range=(10, 10),
-                    size_range=(20, 40),
-                    duration_updates=500,  # 초기 500 업데이트
+                    box_count_range=(20, 20),
+                    size_range=(10, 50),
+                    duration_updates=15000,  # 초기 500 업데이트
                     success_threshold=0.70
                 ),
                 CurriculumStage(
                     name="Stage2_Medium",
                     box_count_range=(15, 15),
                     size_range=(15, 45),
-                    duration_updates=1000,
+                    duration_updates=60,
                     success_threshold=0.75
                 ),
                 CurriculumStage(
                     name="Stage3_Hard",
                     box_count_range=(20, 20),
                     size_range=(12, 50),
-                    duration_updates=2000,
+                    duration_updates=120,
                     success_threshold=0.80
                 ),
                 CurriculumStage(
