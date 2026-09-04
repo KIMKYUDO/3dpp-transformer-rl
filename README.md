@@ -1,57 +1,43 @@
-# 2025-2학기 경북대학교
+# Transformer-Based Reinforcement Learning for 3D Packing
 
-## 프로젝트 개요
-- 강화학습 기반 3D 컨테이너 적재 최적화 시스템 개발
-  - 3D 포장 문제 정의 및 환경 구성
-  - 트랜스포머 기반 강화학습 에이전트 학습
-  - 시뮬레이션 및 시각화 기반 실험 수행
+A Kyungpook National University team project on **3D container packing for reverse logistics**, exploring transformer-based policies and Proximal Policy Optimization (PPO).
 
-## 프로젝트 개요
-본 프로젝트는 **강화학습 기반 3D 컨테이너 적재 최적화 시스템** 개발을 목표로 하는 산학협력 과제입니다.  
-온라인 쇼핑 및 이커머스 확산으로 반품 물류 처리량이 급증하고 있으며, 다양한 규격의 박스를 컨테이너에 효율적으로 적재하는 것은 물류비 절감과 작업 표준화의 핵심 과제입니다.  
+## Research focus
 
-기존 방식은 작업자 경험에 크게 의존해 **공간 활용률 저하** 및 **효율 편차** 문제가 발생했습니다.  
-이를 해결하기 위해, 본 연구에서는 **트랜스포머 기반 강화학습(PPO)**을 적용하여 효율적이고 안정적인 적재 전략을 학습·검증합니다.
+How can a learned policy select, orient, and place items while improving container space utilization?
 
-## 프로젝트 문서
-- 프로젝트 문서는 아래 Notion 페이지에서 정리합니다.
-- Notion : https://www.notion.so/returnall/2025-2-26adad4051a680a7bedfd65b457deed5?source=copy_link
+The project combines a packing simulator, transformer-based policy/value components, and reinforcement-learning training. Space utilization is a project objective, not a claim of independently verified improvement over every baseline.
 
----
+## What is in this repository?
 
-## 연구 목표
-1. **3D 포장 문제 정의 및 시뮬레이션 환경 구현**  
-   - 박스 회전 허용, 컨테이너 가로·세로 고정, 높이 가변  
-   - 목표 지표: 공간 활용률(UR, Utilization Rate) 최대화  
+| Component | Location |
+|---|---|
+| Container simulation | [envs/container_sim.py](envs/container_sim.py) |
+| Transformer and policy/value components | [agents/](agents/) |
+| PPO training | [train/train_ppo.py](train/train_ppo.py) |
+| Environment, model, and training settings | [configs/](configs/) |
+| Benchmark entry point | [benchmark.py](benchmark.py) |
+| Component tests | [tests/](tests/) |
+| Proposal and project records | [docs/](docs/) |
 
-2. **트랜스포머 기반 강화학습 에이전트 개발**  
-   - Box/Container 인코더 + Position/Selection/Orientation 디코더 구조  
-   - PPO + GAE 기반 정책 학습  
+This is a shared project codebase. Repository ownership alone should not be interpreted as sole authorship of all components.
 
-3. **성능 검증 및 시각화**  
-   - 다양한 조건에서 실험 수행  
-   - 결과는 3D 시각화 및 지표(UR, Gap 등)로 평가  
+## Getting started
 
----
+1. Create an isolated Python environment.
+2. Install the declared dependencies:
 
-## 기대 효과
-- **물류비 절감**: 컨테이너 공간 활용률 극대화  
-- **작업 표준화**: AI 기반 정책으로 숙련도 편차 감소  
-- **산학협력 가치**: 최신 강화학습·트랜스포머 연구 성과의 실용화 가능성 검증  
-- **확장성**: 물류·자동화 산업 전반에 적용 가능  
-
----
-
-## 코드 구조 (요약)
-본 프로젝트의 내부 코드는 다음과 같은 구조로 정리되어 있습니다. (세부 내용은 개발자 README 참조)
-
+```bash
+pip install -r requirements-cpu.txt
 ```
-projects/
-├─ agents/        # 트랜스포머 백본·정책/가치 네트워크
-├─ configs/       # 환경, 모델, 학습 하이퍼파라미터 설정
-├─ envs/          # 3D 컨테이너 시뮬레이션 환경
-├─ results/       # 로그, 체크포인트, 시각화 결과
-├─ tests/         # 단위 테스트 코드
-├─ train/         # PPO 학습 스크립트
-└─ utils/         # 전처리 및 보조 유틸리티
-```
+
+3. Review the settings in `configs/` and the training entry point before launching an experiment.
+4. Inspect the benchmark and tests for the experiment-specific inputs and expected behavior.
+
+The repository contains research code and a proposal. End-to-end training and benchmark results were not re-run during the documentation cleanup; no new performance claim is made here.
+
+## Project records
+
+- [Proposal and supporting documents](docs/)
+- [Additional project notes on Notion](https://www.notion.so/returnall/2025-2-26adad4051a680a7bedfd65b457deed5?source=copy_link) — access may require permission.
+- [Kyudo Kim's research overview](https://github.com/KIMKYUDO)
